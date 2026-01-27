@@ -1,15 +1,14 @@
 #!/bin/bash
 # ====================================================
-# Network Mapping Orchestrator — Version 1.3.4
+# Network Mapping Orchestrator — Version 1.3.5
 # Fully Dockerized | Auto-Elevating | Dry-Run First
 # NetBox uses LibreNMS MariaDB
-# SECRET_KEY auto-generated
-# MariaDB root access robust
+# SECRET_KEY auto-generated and safely quoted
 # ====================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.3.4"
+SCRIPT_VERSION="1.3.5"
 echo "[*] Network Mapping Orchestrator — Version $SCRIPT_VERSION"
 
 # -------------------------------
@@ -109,7 +108,7 @@ docker compose -f "$LIBRENMS_DIR/docker-compose.yml" up -d db redis librenms
 phase_summary "2 & 3 (LibreNMS)"
 
 # -------------------------------
-# Wait for MariaDB readiness (with retries)
+# Wait for MariaDB readiness
 # -------------------------------
 echo "[*] Waiting for MariaDB to accept root connections..."
 MAX_RETRIES=30
@@ -131,9 +130,10 @@ echo "[*] MariaDB is ready for root connections"
 NETBOX_DIR="$BASE_DIR/netbox"
 mkdir -p "$NETBOX_DIR"
 
-# Auto-generate SECRET_KEY
+# Auto-generate SECRET_KEY and safely quote it
 NETBOX_SECRET=$(openssl rand -base64 64)
-echo "[*] Generated NetBox SECRET_KEY"
+NETBOX_SECRET_ESCAPED="\"${NETBOX_SECRET}\""
+echo "[*] Generated NetBox SECRET_KEY (safely quoted)"
 
 cat > "$NETBOX_DIR/netbox.env" <<EOF
 ALLOWED_HOSTS=*
@@ -145,7 +145,7 @@ DB_PORT=3306
 DB_WAIT_ATTEMPTS=30
 DB_WAIT_SLEEP=5
 DB_WAIT_DEBUG=1
-SECRET_KEY=${NETBOX_SECRET}
+SECRET_KEY=${NETBOX_SECRET_ESCAPED}
 EOF
 
 cat > "$NETBOX_DIR/docker-compose.yml" <<'EOF'
@@ -322,7 +322,7 @@ phase_summary 8
 echo
 echo "===================================================="
 echo "[*] Full Phase 0 → 8 bootstrap completed (dry-run)"
-echo "[*] NetBox SECRET_KEY has been auto-generated"
+echo "[*] NetBox SECRET_KEY has been auto-generated and safely quoted"
 echo "[*] Next steps:"
 echo "  1) Populate ingestion logic, promotion rules, scoring algorithms"
 echo "  2) Configure network capture interfaces for passive tools"
