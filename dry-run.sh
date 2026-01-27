@@ -1,14 +1,15 @@
 #!/bin/bash
 # ====================================================
-# Network Mapping Orchestrator — Version 1.3.3
+# Network Mapping Orchestrator — Version 1.3.4
 # Fully Dockerized | Auto-Elevating | Dry-Run First
 # NetBox uses LibreNMS MariaDB
 # SECRET_KEY auto-generated
+# MariaDB root access robust
 # ====================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.3.3"
+SCRIPT_VERSION="1.3.4"
 echo "[*] Network Mapping Orchestrator — Version $SCRIPT_VERSION"
 
 # -------------------------------
@@ -28,8 +29,8 @@ auto_elevate "$@"
 # -------------------------------
 read -rp "Enter base directory for deployment [/opt/netbox-docker]: " USER_BASE_DIR
 BASE_DIR="${USER_BASE_DIR:-/opt/netbox-docker}"
-echo "[*] Using base directory: $BASE_DIR"
 mkdir -p "$BASE_DIR"
+echo "[*] Using base directory: $BASE_DIR"
 
 # -------------------------------
 # Function: Phase Summary
@@ -43,7 +44,7 @@ phase_summary() {
 }
 
 # -------------------------------
-# Phase 0: Define Truth & Tags
+# Phase 0: Tags
 # -------------------------------
 mkdir -p "$BASE_DIR/phase0"
 cat > "$BASE_DIR/phase0/tags.env" <<'EOF'
@@ -52,7 +53,7 @@ EOF
 phase_summary 0
 
 # -------------------------------
-# Phase 2 & 3: LibreNMS Database & Discovery Stack
+# Phase 2 & 3: LibreNMS DB
 # -------------------------------
 LIBRENMS_DIR="$BASE_DIR/librenms"
 mkdir -p "$LIBRENMS_DIR"
@@ -108,14 +109,21 @@ docker compose -f "$LIBRENMS_DIR/docker-compose.yml" up -d db redis librenms
 phase_summary "2 & 3 (LibreNMS)"
 
 # -------------------------------
-# Wait for MariaDB readiness
+# Wait for MariaDB readiness (with retries)
 # -------------------------------
-echo "[*] Waiting for MariaDB to be ready..."
-until docker exec librenms-db mysqladmin ping -uroot -prootpassword --silent; do
-    echo "[*] MariaDB not ready yet..."
+echo "[*] Waiting for MariaDB to accept root connections..."
+MAX_RETRIES=30
+COUNT=0
+until docker exec librenms-db mysql -uroot -prootpassword -e "SELECT 1;" &>/dev/null; do
+    COUNT=$((COUNT+1))
+    if [ $COUNT -ge $MAX_RETRIES ]; then
+        echo "[!] MariaDB did not become ready in time. Exiting."
+        exit 1
+    fi
+    echo "[*] MariaDB not ready yet... retry $COUNT/$MAX_RETRIES"
     sleep 2
 done
-echo "[*] MariaDB is ready"
+echo "[*] MariaDB is ready for root connections"
 
 # -------------------------------
 # Phase 1: NetBox Skeleton
@@ -154,14 +162,16 @@ services:
     restart: unless-stopped
 EOF
 
-# Create NetBox DB & User in LibreNMS MariaDB
-echo "[*] Creating NetBox database and user..."
-docker exec -i librenms-db sh -c "mysql -uroot -prootpassword -e \"
+# -------------------------------
+# Create NetBox DB & User inside MariaDB container
+# -------------------------------
+echo "[*] Creating NetBox database and user inside LibreNMS MariaDB..."
+docker exec -i librenms-db sh -c "mysql -uroot -prootpassword <<SQL
 CREATE DATABASE IF NOT EXISTS netbox CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
 CREATE USER IF NOT EXISTS 'netbox'@'%' IDENTIFIED BY 'netbox123';
 GRANT ALL PRIVILEGES ON netbox.* TO 'netbox'@'%';
 FLUSH PRIVILEGES;
-\""
+SQL"
 
 docker pull netboxcommunity/netbox:latest
 docker compose -f "$NETBOX_DIR/docker-compose.yml" up -d netbox
