@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================
-# All-in-One Network Mapping Deployment Orchestrator
+# Network Mapping Orchestrator — Version 1.1.0
 # Phases 0 → 8
 # Fully Dockerized | Auto-Elevating | Dry-Run First
 # ====================================================
@@ -20,14 +20,13 @@ auto_elevate() {
     exit 0
   fi
 }
-
 auto_elevate "$@"
 
 # -------------------------------
 # Prompt for Base Directory
 # -------------------------------
-read -rp "Enter base directory for deployment [/opt/netbox-docker]: " USER_BASE_DIR
-BASE_DIR="${USER_BASE_DIR:-/opt/netbox-docker}"
+read -rp "Enter base directory for deployment [/opt/netbox-discovery]: " USER_BASE_DIR
+BASE_DIR="${USER_BASE_DIR:-/opt/netbox-discovery}"
 echo "[*] Using base directory: $BASE_DIR"
 mkdir -p "$BASE_DIR"
 
@@ -56,7 +55,6 @@ phase_summary 0
 # -------------------------------
 mkdir -p "$BASE_DIR/netbox"
 cat > "$BASE_DIR/netbox/docker-compose.yml" <<'EOF'
-version: '3.8'
 services:
   netbox:
     image: netboxcommunity/netbox:latest
@@ -91,10 +89,7 @@ phase_summary 1
 LIBRENMS_DIR="$BASE_DIR/librenms"
 mkdir -p "$LIBRENMS_DIR"
 
-# docker-compose.yml
 cat > "$LIBRENMS_DIR/docker-compose.yml" <<'EOF'
-version: '3.8'
-
 services:
   db:
     image: mariadb:10.11
@@ -128,7 +123,6 @@ services:
     restart: unless-stopped
 EOF
 
-# librenms.env
 cat > "$LIBRENMS_DIR/librenms.env" <<EOF
 APP_KEY=$(openssl rand -base64 32)
 BASE_URL=http://localhost:8001
@@ -169,7 +163,6 @@ EOF
 
 # docker-compose.yml using local build
 cat > "$INGESTION_DIR/docker-compose.yml" <<'EOF'
-version: '3.8'
 services:
   ingestion:
     build: .
@@ -263,7 +256,7 @@ EOF
       cat > "$BASE_DIR/passive/suricata/docker-compose.yml" <<'EOF'
 services:
   suricata:
-    image: oisf/suricata:latest
+    image: jasonish/suricata:latest
     container_name: suricata
     network_mode: host
     cap_add:
@@ -274,7 +267,7 @@ services:
       - ./suricata-logs:/var/log/suricata
     restart: unless-stopped
 EOF
-      docker pull oisf/suricata:latest
+      docker pull jasonish/suricata:latest
       ;;
   esac
 
