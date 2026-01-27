@@ -7,6 +7,9 @@
 
 set -euo pipefail
 
+SCRIPT_VERSION="1.1.0"
+echo "[*] Network Mapping Orchestrator — Version $SCRIPT_VERSION"
+
 # -------------------------------
 # Function: Auto-Elevate
 # -------------------------------
@@ -226,9 +229,7 @@ for svc in "${PASSIVE_SERVICES[@]}"; do
   
   case $svc in
     zeek)
-      # Official Zeek image with host networking & required capabilities
       cat > "$BASE_DIR/passive/zeek/docker-compose.yml" <<'EOF'
-version: '3.8'
 services:
   zeek:
     image: zeek/zeek:latest
@@ -242,27 +243,40 @@ services:
     command: ["zeek", "-i", "eth0"] # change eth0 to your capture interface
     restart: unless-stopped
 EOF
+      docker pull zeek/zeek:latest
       ;;
-    ntopng|suricata)
-      cat > "$BASE_DIR/passive/$svc/docker-compose.yml" <<EOF
-version: '3.8'
+    ntopng)
+      cat > "$BASE_DIR/passive/ntopng/docker-compose.yml" <<'EOF'
 services:
-  $svc:
-    image: $svc:latest
-    container_name: $svc
+  ntopng:
+    image: ntop/ntopng:latest
+    container_name: ntopng
+    ports:
+      - "3000:3000"
     volumes:
       - ./data:/data
     restart: unless-stopped
 EOF
+      docker pull ntop/ntopng:latest
+      ;;
+    suricata)
+      cat > "$BASE_DIR/passive/suricata/docker-compose.yml" <<'EOF'
+services:
+  suricata:
+    image: oisf/suricata:latest
+    container_name: suricata
+    network_mode: host
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    volumes:
+      - ./suricata-rules:/etc/suricata/rules
+      - ./suricata-logs:/var/log/suricata
+    restart: unless-stopped
+EOF
+      docker pull oisf/suricata:latest
       ;;
   esac
-
-  echo "[*] Pulling $svc Docker image..."
-  if [[ $svc == "zeek" ]]; then
-    docker pull zeek/zeek:latest
-  else
-    docker pull ${svc}:latest || echo "[!] Image $svc not found locally, skipping..."
-  fi
 
   echo "[*] Starting $svc..."
   docker compose -f "$BASE_DIR/passive/$svc/docker-compose.yml" up -d
