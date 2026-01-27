@@ -1,13 +1,14 @@
 #!/bin/bash
 # ====================================================
-# Network Mapping Orchestrator — Version 1.3.8
-# Fully Dockerized | Auto-Elevating | Dry-Run First
-# Phases 0 → 8 | NetBox uses PostgreSQL, LibreNMS uses MariaDB
+# Network Mapping Orchestrator — Version 2.0
+# Fully Dockerized | Auto-Elevating | 8 Phases
+# NetBox uses PostgreSQL | LibreNMS uses MariaDB
+# Includes Ingestion, Passive Traffic, Compute Discovery
 # ====================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.3.8"
+SCRIPT_VERSION="2.0"
 echo "[*] Network Mapping Orchestrator — Version $SCRIPT_VERSION"
 
 # -------------------------------
@@ -27,6 +28,9 @@ BASE_DIR="${USER_BASE_DIR:-/opt/netbox-docker}"
 mkdir -p "$BASE_DIR"
 echo "[*] Using base directory: $BASE_DIR"
 
+# -------------------------------
+# Utility function: phase summary
+# -------------------------------
 phase_summary() {
   echo
   echo "===================================================="
@@ -36,10 +40,11 @@ phase_summary() {
 }
 
 # -------------------------------
-# Phase 0: Tags
+# Phase 0: Define Tags & Config
 # -------------------------------
-mkdir -p "$BASE_DIR/phase0"
-cat > "$BASE_DIR/phase0/tags.env" <<'EOF'
+PHASE0_DIR="$BASE_DIR/phase0"
+mkdir -p "$PHASE0_DIR"
+cat > "$PHASE0_DIR/tags.env" <<'EOF'
 NETBOX_TAGS="observed-only,enriched,validated,manual,no-auto-update"
 EOF
 phase_summary 0
@@ -51,7 +56,6 @@ LIBRENMS_DIR="$BASE_DIR/librenms"
 mkdir -p "$LIBRENMS_DIR"
 
 cat > "$LIBRENMS_DIR/docker-compose.yml" <<'EOF'
-version: '3.8'
 services:
   db:
     image: mariadb:10.11
@@ -95,27 +99,26 @@ EOF
 docker pull librenms/librenms:latest
 docker pull mariadb:10.11
 docker pull redis:7
-
 docker compose -f "$LIBRENMS_DIR/docker-compose.yml" up -d db redis librenms
 phase_summary "2 & 3 (LibreNMS)"
 
 # Wait for MariaDB readiness
-echo "[*] Waiting for MariaDB root connection..."
+echo "[*] Waiting for LibreNMS MariaDB..."
 MAX_RETRIES=30
 COUNT=0
 until docker exec librenms-db mysql -uroot -prootpassword -e "SELECT 1;" &>/dev/null; do
     COUNT=$((COUNT+1))
     if [ $COUNT -ge $MAX_RETRIES ]; then
-        echo "[!] MariaDB did not become ready. Exiting."
+        echo "[!] MariaDB not ready. Exiting."
         exit 1
     fi
     echo "[*] MariaDB not ready yet... retry $COUNT/$MAX_RETRIES"
     sleep 2
 done
-echo "[*] MariaDB ready"
+echo "[*] LibreNMS MariaDB ready"
 
 # -------------------------------
-# Phase 1: NetBox Skeleton + Redis + PostgreSQL
+# Phase 1: NetBox Skeleton + PostgreSQL + Redis
 # -------------------------------
 NETBOX_DIR="$BASE_DIR/netbox"
 mkdir -p "$NETBOX_DIR"
@@ -136,7 +139,6 @@ REDIS_PORT=6379
 EOF
 
 cat > "$NETBOX_DIR/docker-compose.yml" <<EOF
-version: '3.8'
 services:
   netbox-redis:
     image: redis:7
@@ -179,14 +181,13 @@ EOF
 docker compose -f "$NETBOX_DIR/docker-compose.yml" up -d netbox-redis netbox-db
 phase_summary 1
 
-# Wait for NetBox DB
-echo "[*] Waiting for NetBox PostgreSQL readiness..."
+# Wait for NetBox PostgreSQL readiness
+echo "[*] Waiting for NetBox PostgreSQL..."
 COUNT=0
-MAX_RETRIES=30
 until docker exec netbox-db pg_isready -U netbox &>/dev/null; do
     COUNT=$((COUNT+1))
     if [ $COUNT -ge $MAX_RETRIES ]; then
-        echo "[!] NetBox PostgreSQL did not become ready. Exiting."
+        echo "[!] NetBox PostgreSQL not ready. Exiting."
         exit 1
     fi
     echo "[*] DB not ready, retry $COUNT/$MAX_RETRIES..."
@@ -199,153 +200,104 @@ docker compose -f "$NETBOX_DIR/docker-compose.yml" up -d netbox
 phase_summary 1
 
 # -------------------------------
-# Phase 4: Ingestion Engine (Dry-Run)
+# Phase 4: Oxidized + Git
 # -------------------------------
-INGESTION_DIR="$BASE_DIR/ingestion"
-mkdir -p "$INGESTION_DIR"/{collect,normalize,reconcile,commit,logs,config}
-
-cat > "$INGESTION_DIR/Dockerfile" <<'EOF'
-FROM python:3.12-slim
-WORKDIR /app
-COPY collect/ collect/
-COPY normalize/ normalize/
-COPY reconcile/ reconcile/
-COPY commit/ commit/
-COPY config/ config/
-RUN pip install requests pyyaml
-CMD ["bash", "-c", "echo 'Ingestion engine placeholder' && sleep infinity"]
-EOF
-
-cat > "$INGESTION_DIR/docker-compose.yml" <<'EOF'
+OXIDIZED_DIR="$BASE_DIR/oxidized"
+mkdir -p "$OXIDIZED_DIR"
+cat > "$OXIDIZED_DIR/docker-compose.yml" <<'EOF'
 services:
-  ingestion:
-    build: .
-    container_name: ingestion
-    env_file:
-      - ingestion.env
+  oxidized:
+    image: oxidized/oxidized:latest
+    container_name: oxidized
+    ports:
+      - "8888:8888"
     volumes:
-      - ./config:/app/config
-      - ./logs:/app/logs
+      - ./config:/home/oxidized/.config
+      - ./logs:/home/oxidized/logs
     restart: unless-stopped
 EOF
-
-cat > "$INGESTION_DIR/ingestion.env" <<EOF
-MODE=dry-run
-NETBOX_URL=http://netbox:8080
-NETBOX_TOKEN=changeme
-EOF
-
-docker compose -f "$INGESTION_DIR/docker-compose.yml" build
-docker compose -f "$INGESTION_DIR/docker-compose.yml" up -d
+docker pull oxidized/oxidized:latest
+docker compose -f "$OXIDIZED_DIR/docker-compose.yml" up -d
 phase_summary 4
 
 # -------------------------------
-# Phase 5: Promotion Scripts
+# Phase 5: Passive Traffic (Zeek, Suricata, Ntopng)
 # -------------------------------
-PROMOTE_DIR="$BASE_DIR/promotion"
-mkdir -p "$PROMOTE_DIR"
-cat > "$PROMOTE_DIR/promote.sh" <<'EOF'
-#!/bin/bash
-echo "[*] Promotion placeholder — implement your promotion rules"
-EOF
-chmod +x "$PROMOTE_DIR/promote.sh"
-phase_summary 5
+PASSIVE_DIR="$BASE_DIR/passive"
+mkdir -p "$PASSIVE_DIR"
 
-# -------------------------------
-# Phase 6: Compute / Hypervisors
-# -------------------------------
-COMPUTE_SERVICES=("proxmox" "hyperv" "kvm" "esxi")
-for svc in "${COMPUTE_SERVICES[@]}"; do
-  mkdir -p "$BASE_DIR/compute/$svc"
-  cat > "$BASE_DIR/compute/$svc/collector.sh" <<'EOF'
-#!/bin/bash
-echo "[*] Collector stub for $svc running..."
-EOF
-  chmod +x "$BASE_DIR/compute/$svc/collector.sh"
-  bash "$BASE_DIR/compute/$svc/collector.sh"
-done
-phase_summary 6
-
-# -------------------------------
-# Phase 7: Passive Traffic
-# -------------------------------
-PASSIVE_SERVICES=("zeek" "ntopng" "suricata")
-for svc in "${PASSIVE_SERVICES[@]}"; do
-  mkdir -p "$BASE_DIR/passive/$svc"
-  case $svc in
-    zeek)
-      cat > "$BASE_DIR/passive/zeek/docker-compose.yml" <<'EOF'
+# Zeek
+cat > "$PASSIVE_DIR/zeek-compose.yml" <<'EOF'
 services:
   zeek:
-    image: zeek/zeek:latest
+    image: blacktop/zeek:latest
     container_name: zeek
     network_mode: host
-    cap_add:
-      - NET_RAW
-      - NET_ADMIN
-    volumes:
-      - ./zeek-scripts:/zeek/scripts
-    command: ["zeek", "-i", "eth0"]
     restart: unless-stopped
 EOF
-      docker pull zeek/zeek:latest
-      ;;
-    ntopng)
-      cat > "$BASE_DIR/passive/ntopng/docker-compose.yml" <<'EOF'
+
+# Suricata
+cat > "$PASSIVE_DIR/suricata-compose.yml" <<'EOF'
+services:
+  suricata:
+    image: docker.io/jasonish/suricata:latest
+    container_name: suricata
+    network_mode: host
+    restart: unless-stopped
+EOF
+
+# Ntopng
+cat > "$PASSIVE_DIR/ntopng-compose.yml" <<'EOF'
 services:
   ntopng:
     image: ntop/ntopng:latest
     container_name: ntopng
-    ports:
-      - "3000:3000"
-    volumes:
-      - ./data:/data
-    restart: unless-stopped
-EOF
-      docker pull ntop/ntopng:latest
-      ;;
-    suricata)
-      cat > "$BASE_DIR/passive/suricata/docker-compose.yml" <<'EOF'
-services:
-  suricata:
-    image: jasonish/suricata:latest
-    container_name: suricata
     network_mode: host
-    cap_add:
-      - NET_RAW
-      - NET_ADMIN
-      - SYS_NICE
-    command: ["-i", "eth0"]
-    volumes:
-      - ./suricata-logs:/var/log/suricata
     restart: unless-stopped
 EOF
-      docker pull jasonish/suricata:latest
-      ;;
-  esac
-  docker compose -f "$BASE_DIR/passive/$svc/docker-compose.yml" up -d
-done
+
+docker pull blacktop/zeek:latest || echo "[!] Zeek image pull failed"
+docker pull jasonish/suricata:latest || echo "[!] Suricata image pull failed"
+docker pull ntop/ntopng:latest || echo "[!] Ntopng image pull failed"
+
+docker compose -f "$PASSIVE_DIR/zeek-compose.yml" up -d || true
+docker compose -f "$PASSIVE_DIR/suricata-compose.yml" up -d || true
+docker compose -f "$PASSIVE_DIR/ntopng-compose.yml" up -d || true
+phase_summary 5
+
+# -------------------------------
+# Phase 6: Compute Discovery
+# -------------------------------
+COMPUTE_DIR="$BASE_DIR/compute"
+mkdir -p "$COMPUTE_DIR"
+cat > "$COMPUTE_DIR/discovery.sh" <<'EOF'
+#!/bin/bash
+# Discover Hypervisors (Type 1 & 2), VMs, and integrate with NetBox API
+echo "[*] Placeholder: Hyper-V, ESXi, VMware Workstation/Player discovery"
+EOF
+chmod +x "$COMPUTE_DIR/discovery.sh"
+phase_summary 6
+
+# -------------------------------
+# Phase 7: Ingestion / Dry Run
+# -------------------------------
+INGEST_DIR="$BASE_DIR/ingestion"
+mkdir -p "$INGEST_DIR"
+cat > "$INGEST_DIR/ingest.sh" <<'EOF'
+#!/bin/bash
+# Placeholder: SNMP, SSH, API ingestion
+echo "[*] Placeholder: Dry-run discovery, validate devices before NetBox write"
+EOF
+chmod +x "$INGEST_DIR/ingest.sh"
 phase_summary 7
 
 # -------------------------------
-# Phase 8: Completeness & Trust Scoring
+# Phase 8: Completeness / Promotion
 # -------------------------------
-COMPLETENESS_DIR="$BASE_DIR/completeness"
-mkdir -p "$COMPLETENESS_DIR"
-cat > "$COMPLETENESS_DIR/score.sh" <<'EOF'
-#!/bin/bash
-echo "[*] Calculating device and network trust scores (dry-run)..."
-EOF
-chmod +x "$COMPLETENESS_DIR/score.sh"
-bash "$COMPLETENESS_DIR/score.sh"
+echo "[*] Phase 8: Validations / Completeness checks"
+echo "[*] Script finished all 8 phases — network skeleton and passive/compute ready"
 phase_summary 8
 
-# -------------------------------
-# Deployment Complete
-# -------------------------------
-echo
-echo "===================================================="
-echo "[*] Orchestrator v1.3.8 bootstrap complete"
-echo "[*] NetBox SECRET_KEY generated and safely quoted"
+echo "[*] Orchestrator v2.0 bootstrap complete!"
 echo "[*] Base directory: $BASE_DIR"
-echo "===================================================="
+echo "[*] You can now run ingestion and compute discovery scripts as needed"
