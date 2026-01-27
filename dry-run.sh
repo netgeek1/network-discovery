@@ -1,19 +1,18 @@
 #!/bin/bash
 # ====================================================
-# Network Mapping Orchestrator — Version 1.3.2
-# Phases 0 → 8
+# Network Mapping Orchestrator — Version 1.3.3
 # Fully Dockerized | Auto-Elevating | Dry-Run First
 # NetBox uses LibreNMS MariaDB
-# Manual DB readiness check (no depends_on)
+# SECRET_KEY auto-generated
 # ====================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.3.2"
+SCRIPT_VERSION="1.3.3"
 echo "[*] Network Mapping Orchestrator — Version $SCRIPT_VERSION"
 
 # -------------------------------
-# Function: Auto-Elevate
+# Auto-Elevate
 # -------------------------------
 auto_elevate() {
   if [[ $EUID -ne 0 ]]; then
@@ -119,10 +118,27 @@ done
 echo "[*] MariaDB is ready"
 
 # -------------------------------
-# Phase 1: NetBox Skeleton (After DB)
+# Phase 1: NetBox Skeleton
 # -------------------------------
 NETBOX_DIR="$BASE_DIR/netbox"
 mkdir -p "$NETBOX_DIR"
+
+# Auto-generate SECRET_KEY
+NETBOX_SECRET=$(openssl rand -base64 64)
+echo "[*] Generated NetBox SECRET_KEY"
+
+cat > "$NETBOX_DIR/netbox.env" <<EOF
+ALLOWED_HOSTS=*
+DB_NAME=netbox
+DB_USER=netbox
+DB_PASSWORD=netbox123
+DB_HOST=db
+DB_PORT=3306
+DB_WAIT_ATTEMPTS=30
+DB_WAIT_SLEEP=5
+DB_WAIT_DEBUG=1
+SECRET_KEY=${NETBOX_SECRET}
+EOF
 
 cat > "$NETBOX_DIR/docker-compose.yml" <<'EOF'
 services:
@@ -138,22 +154,8 @@ services:
     restart: unless-stopped
 EOF
 
-cat > "$NETBOX_DIR/netbox.env" <<EOF
-ALLOWED_HOSTS=*
-DB_NAME=netbox
-DB_USER=netbox
-DB_PASSWORD=netbox123
-DB_HOST=db
-DB_PORT=3306
-DB_WAIT_ATTEMPTS=30
-DB_WAIT_SLEEP=5
-DB_WAIT_DEBUG=1
-EOF
-
-# -------------------------------
-# Create NetBox DB & User inside MariaDB
-# -------------------------------
-echo "[*] Creating NetBox database and user in LibreNMS MariaDB..."
+# Create NetBox DB & User in LibreNMS MariaDB
+echo "[*] Creating NetBox database and user..."
 docker exec -i librenms-db sh -c "mysql -uroot -prootpassword -e \"
 CREATE DATABASE IF NOT EXISTS netbox CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
 CREATE USER IF NOT EXISTS 'netbox'@'%' IDENTIFIED BY 'netbox123';
@@ -161,10 +163,7 @@ GRANT ALL PRIVILEGES ON netbox.* TO 'netbox'@'%';
 FLUSH PRIVILEGES;
 \""
 
-echo "[*] Pulling NetBox Docker image..."
 docker pull netboxcommunity/netbox:latest
-
-echo "[*] Starting NetBox..."
 docker compose -f "$NETBOX_DIR/docker-compose.yml" up -d netbox
 phase_summary 1
 
@@ -205,10 +204,7 @@ NETBOX_URL=http://netbox:8080
 NETBOX_TOKEN=changeme
 EOF
 
-echo "[*] Building local ingestion Docker image..."
 docker compose -f "$INGESTION_DIR/docker-compose.yml" build
-
-echo "[*] Starting ingestion engine (dry-run)..."
 docker compose -f "$INGESTION_DIR/docker-compose.yml" up -d
 phase_summary 4
 
@@ -231,7 +227,6 @@ for svc in "${COMPUTE_SERVICES[@]}"; do
 echo "[*] Collector stub for $svc running..."
 EOF
   chmod +x "$BASE_DIR/compute/$svc/collector.sh"
-  echo "[*] Running collector for $svc (dry-run)..."
   bash "$BASE_DIR/compute/$svc/collector.sh"
 done
 phase_summary 6
@@ -256,7 +251,7 @@ services:
       - NET_ADMIN
     volumes:
       - ./zeek-scripts:/zeek/scripts
-    command: ["zeek", "-i", "eth0"] # change eth0 to your capture interface
+    command: ["zeek", "-i", "eth0"]
     restart: unless-stopped
 EOF
       docker pull zeek/zeek:latest
@@ -286,7 +281,7 @@ services:
       - NET_RAW
       - NET_ADMIN
       - SYS_NICE
-    command: ["-i", "eth0"] # Replace 'eth0' with your capture interface
+    command: ["-i", "eth0"]
     volumes:
       - ./suricata-logs:/var/log/suricata
     restart: unless-stopped
@@ -295,7 +290,6 @@ EOF
       ;;
   esac
 
-  echo "[*] Starting $svc..."
   docker compose -f "$BASE_DIR/passive/$svc/docker-compose.yml" up -d
 done
 phase_summary 7
@@ -318,9 +312,10 @@ phase_summary 8
 echo
 echo "===================================================="
 echo "[*] Full Phase 0 → 8 bootstrap completed (dry-run)"
+echo "[*] NetBox SECRET_KEY has been auto-generated"
 echo "[*] Next steps:"
-echo "  1) Populate env files with real credentials"
-echo "  2) Implement ingestion logic, promotion rules, scoring algorithms"
-echo "  3) Start monitoring, passive traffic collection, and actual data ingestion"
+echo "  1) Populate ingestion logic, promotion rules, scoring algorithms"
+echo "  2) Configure network capture interfaces for passive tools"
+echo "  3) Start full monitoring and data ingestion"
 echo "===================================================="
 echo
