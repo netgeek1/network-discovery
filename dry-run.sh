@@ -1,13 +1,13 @@
 #!/bin/bash
 # ====================================================
-# Network Mapping Orchestrator — Version 1.1.1
+# Network Mapping Orchestrator — Version 1.1.2
 # Phases 0 → 8
 # Fully Dockerized | Auto-Elevating | Dry-Run First
 # ====================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.1.2"
 echo "[*] Network Mapping Orchestrator — Version $SCRIPT_VERSION"
 
 # -------------------------------
@@ -25,8 +25,8 @@ auto_elevate "$@"
 # -------------------------------
 # Prompt for Base Directory
 # -------------------------------
-read -rp "Enter base directory for deployment [/opt/netbox-discovery]: " USER_BASE_DIR
-BASE_DIR="${USER_BASE_DIR:-/opt/netbox-discovery}"
+read -rp "Enter base directory for deployment [/opt/netbox-docker]: " USER_BASE_DIR
+BASE_DIR="${USER_BASE_DIR:-/opt/netbox-docker}"
 echo "[*] Using base directory: $BASE_DIR"
 mkdir -p "$BASE_DIR"
 
