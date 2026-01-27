@@ -20,7 +20,7 @@ auto_elevate "$@"
 # -------------------------------
 # Base Directory
 # -------------------------------
-BASE_DIR="/opt/nautobot-docker"
+BASE_DIR="/opt/netbox-docker"
 echo "[*] Creating base directory at $BASE_DIR..."
 mkdir -p "$BASE_DIR"
 
