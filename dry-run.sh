@@ -199,10 +199,153 @@ docker compose -f "$NETBOX_DIR/docker-compose.yml" up -d netbox
 phase_summary 1
 
 # -------------------------------
-# Phases 4 → 8: Ingestion, Compute, Passive, Promotion, Completeness
-# [Same as v1.3.7, unchanged]
+# Phase 4: Ingestion Engine (Dry-Run)
 # -------------------------------
+INGESTION_DIR="$BASE_DIR/ingestion"
+mkdir -p "$INGESTION_DIR"/{collect,normalize,reconcile,commit,logs,config}
 
+cat > "$INGESTION_DIR/Dockerfile" <<'EOF'
+FROM python:3.12-slim
+WORKDIR /app
+COPY collect/ collect/
+COPY normalize/ normalize/
+COPY reconcile/ reconcile/
+COPY commit/ commit/
+COPY config/ config/
+RUN pip install requests pyyaml
+CMD ["bash", "-c", "echo 'Ingestion engine placeholder' && sleep infinity"]
+EOF
+
+cat > "$INGESTION_DIR/docker-compose.yml" <<'EOF'
+services:
+  ingestion:
+    build: .
+    container_name: ingestion
+    env_file:
+      - ingestion.env
+    volumes:
+      - ./config:/app/config
+      - ./logs:/app/logs
+    restart: unless-stopped
+EOF
+
+cat > "$INGESTION_DIR/ingestion.env" <<EOF
+MODE=dry-run
+NETBOX_URL=http://netbox:8080
+NETBOX_TOKEN=changeme
+EOF
+
+docker compose -f "$INGESTION_DIR/docker-compose.yml" build
+docker compose -f "$INGESTION_DIR/docker-compose.yml" up -d
+phase_summary 4
+
+# -------------------------------
+# Phase 5: Promotion Scripts
+# -------------------------------
+PROMOTE_DIR="$BASE_DIR/promotion"
+mkdir -p "$PROMOTE_DIR"
+cat > "$PROMOTE_DIR/promote.sh" <<'EOF'
+#!/bin/bash
+echo "[*] Promotion placeholder — implement your promotion rules"
+EOF
+chmod +x "$PROMOTE_DIR/promote.sh"
+phase_summary 5
+
+# -------------------------------
+# Phase 6: Compute / Hypervisors
+# -------------------------------
+COMPUTE_SERVICES=("proxmox" "hyperv" "kvm" "esxi")
+for svc in "${COMPUTE_SERVICES[@]}"; do
+  mkdir -p "$BASE_DIR/compute/$svc"
+  cat > "$BASE_DIR/compute/$svc/collector.sh" <<'EOF'
+#!/bin/bash
+echo "[*] Collector stub for $svc running..."
+EOF
+  chmod +x "$BASE_DIR/compute/$svc/collector.sh"
+  bash "$BASE_DIR/compute/$svc/collector.sh"
+done
+phase_summary 6
+
+# -------------------------------
+# Phase 7: Passive Traffic
+# -------------------------------
+PASSIVE_SERVICES=("zeek" "ntopng" "suricata")
+for svc in "${PASSIVE_SERVICES[@]}"; do
+  mkdir -p "$BASE_DIR/passive/$svc"
+  case $svc in
+    zeek)
+      cat > "$BASE_DIR/passive/zeek/docker-compose.yml" <<'EOF'
+services:
+  zeek:
+    image: zeek/zeek:latest
+    container_name: zeek
+    network_mode: host
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    volumes:
+      - ./zeek-scripts:/zeek/scripts
+    command: ["zeek", "-i", "eth0"]
+    restart: unless-stopped
+EOF
+      docker pull zeek/zeek:latest
+      ;;
+    ntopng)
+      cat > "$BASE_DIR/passive/ntopng/docker-compose.yml" <<'EOF'
+services:
+  ntopng:
+    image: ntop/ntopng:latest
+    container_name: ntopng
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+EOF
+      docker pull ntop/ntopng:latest
+      ;;
+    suricata)
+      cat > "$BASE_DIR/passive/suricata/docker-compose.yml" <<'EOF'
+services:
+  suricata:
+    image: jasonish/suricata:latest
+    container_name: suricata
+    network_mode: host
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+      - SYS_NICE
+    command: ["-i", "eth0"]
+    volumes:
+      - ./suricata-logs:/var/log/suricata
+    restart: unless-stopped
+EOF
+      docker pull jasonish/suricata:latest
+      ;;
+  esac
+  docker compose -f "$BASE_DIR/passive/$svc/docker-compose.yml" up -d
+done
+phase_summary 7
+
+# -------------------------------
+# Phase 8: Completeness & Trust Scoring
+# -------------------------------
+COMPLETENESS_DIR="$BASE_DIR/completeness"
+mkdir -p "$COMPLETENESS_DIR"
+cat > "$COMPLETENESS_DIR/score.sh" <<'EOF'
+#!/bin/bash
+echo "[*] Calculating device and network trust scores (dry-run)..."
+EOF
+chmod +x "$COMPLETENESS_DIR/score.sh"
+bash "$COMPLETENESS_DIR/score.sh"
+phase_summary 8
+
+# -------------------------------
+# Deployment Complete
+# -------------------------------
+echo
+echo "===================================================="
 echo "[*] Orchestrator v1.3.8 bootstrap complete"
 echo "[*] NetBox SECRET_KEY generated and safely quoted"
 echo "[*] Base directory: $BASE_DIR"
+echo "===================================================="
