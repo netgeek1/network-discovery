@@ -1,13 +1,13 @@
 #!/bin/bash
 # ====================================================
-# Network Mapping Orchestrator — Version 1.1.0
+# Network Mapping Orchestrator — Version 1.1.1
 # Phases 0 → 8
 # Fully Dockerized | Auto-Elevating | Dry-Run First
 # ====================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.1.1"
 echo "[*] Network Mapping Orchestrator — Version $SCRIPT_VERSION"
 
 # -------------------------------
@@ -252,8 +252,8 @@ services:
 EOF
       docker pull ntop/ntopng:latest
       ;;
-    suricata)
-      cat > "$BASE_DIR/passive/suricata/docker-compose.yml" <<'EOF'
+suricata)
+  cat > "$BASE_DIR/passive/suricata/docker-compose.yml" <<'EOF'
 services:
   suricata:
     image: jasonish/suricata:latest
@@ -262,14 +262,16 @@ services:
     cap_add:
       - NET_RAW
       - NET_ADMIN
+      - SYS_NICE
+    command: ["-i", "eth0"] # Replace 'eth0' with your capture interface
     volumes:
-      - ./suricata-rules:/etc/suricata/rules
       - ./suricata-logs:/var/log/suricata
     restart: unless-stopped
 EOF
-      docker pull jasonish/suricata:latest
-      ;;
-  esac
+  echo "[*] Pulling Suricata Docker image..."
+  docker pull jasonish/suricata:latest
+  ;;
+esac
 
   echo "[*] Starting $svc..."
   docker compose -f "$BASE_DIR/passive/$svc/docker-compose.yml" up -d
