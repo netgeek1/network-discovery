@@ -6,7 +6,23 @@
 
 set -euo pipefail
 
-BASE_DIR="/opt/nautobot-docker"
+# -------------------------------
+# Function: Auto-Elevate
+# -------------------------------
+auto_elevate() {
+  if [[ $EUID -ne 0 ]]; then
+    echo "[*] Elevation required. Re-running as root..."
+    exec sudo bash "$0" "$@"
+    exit 0
+  fi
+}
+
+auto_elevate "$@"
+
+# -------------------------------
+# Create base directory
+# -------------------------------
+BASE_DIR="/opt/netbox-docker"
 echo "Creating base directory at $BASE_DIR..."
 mkdir -p "$BASE_DIR"
 
