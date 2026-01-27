@@ -266,7 +266,7 @@ MONITOR_IFACE="${MONITOR_IFACE:-eth0}"
 cat > "$PASSIVE_DIR/zeek-compose.yml" <<EOF
 services:
   zeek:
-    image: zeek/zeek:5.1
+    image: zeek/zeek:lts
     container_name: zeek
     network_mode: host
     command: zeek -i $MONITOR_IFACE
@@ -298,7 +298,7 @@ services:
 EOF
 
 echo "[*] Pulling passive traffic images..."
-docker pull zeek/zeek:5.1 || echo "[!] Zeek image pull failed"
+docker pull zeek/zeek:lts || echo "[!] Zeek image pull failed"
 docker pull jasonish/suricata:latest || echo "[!] Suricata image pull failed"
 docker pull ntop/ntopng:latest || echo "[!] Ntopng image pull failed"
 
