@@ -1,14 +1,15 @@
 #!/bin/bash
 # ====================================================
-# Network Mapping Orchestrator — Version 1.3.0
+# Network Mapping Orchestrator — Version 1.3.1
 # Phases 0 → 8
 # Fully Dockerized | Auto-Elevating | Dry-Run First
 # NetBox uses LibreNMS MariaDB
+# Includes DB readiness check
 # ====================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.3.1"
 echo "[*] Network Mapping Orchestrator — Version $SCRIPT_VERSION"
 
 # -------------------------------
@@ -111,6 +112,16 @@ docker compose -f "$LIBRENMS_DIR/docker-compose.yml" up -d db redis librenms
 phase_summary "2 & 3 (LibreNMS)"
 
 # -------------------------------
+# Wait for MariaDB readiness
+# -------------------------------
+echo "[*] Waiting for MariaDB to be ready..."
+until docker exec librenms-db mysqladmin ping -uroot -prootpassword --silent; do
+    echo "[*] MariaDB not ready yet..."
+    sleep 2
+done
+echo "[*] MariaDB is ready"
+
+# -------------------------------
 # Phase 1: NetBox Skeleton (After DB)
 # -------------------------------
 NETBOX_DIR="$BASE_DIR/netbox"
@@ -144,13 +155,16 @@ DB_WAIT_SLEEP=5
 DB_WAIT_DEBUG=1
 EOF
 
-echo "[*] Creating NetBox DB and user in LibreNMS MariaDB..."
-docker exec -i librenms-db mysql -uroot -prootpassword <<EOF
+# -------------------------------
+# Create NetBox DB & User inside MariaDB
+# -------------------------------
+echo "[*] Creating NetBox database and user in LibreNMS MariaDB..."
+docker exec -i librenms-db sh -c "mysql -uroot -prootpassword -e \"
 CREATE DATABASE IF NOT EXISTS netbox CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
 CREATE USER IF NOT EXISTS 'netbox'@'%' IDENTIFIED BY 'netbox123';
 GRANT ALL PRIVILEGES ON netbox.* TO 'netbox'@'%';
 FLUSH PRIVILEGES;
-EOF
+\""
 
 echo "[*] Pulling NetBox Docker image..."
 docker pull netboxcommunity/netbox:latest
