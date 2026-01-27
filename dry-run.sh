@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================
-# Network Mapping Orchestrator — Version 2.1
+# Network Mapping Orchestrator — Version 2.2
 # Fully Dockerized | Auto-Elevating | 8 Phases
 # NetBox uses PostgreSQL | LibreNMS uses MariaDB
 # Includes Ingestion, Passive Traffic, Compute Discovery
@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.1"
+SCRIPT_VERSION="2.2"
 echo "[*] Network Mapping Orchestrator — Version $SCRIPT_VERSION"
 
 # -------------------------------
@@ -258,34 +258,37 @@ phase_summary 4
 PASSIVE_DIR="$BASE_DIR/passive"
 mkdir -p "$PASSIVE_DIR"
 
-read -rp "Enter interface for Zeek/Suricata (ex: eth0): " USER_IFACE
+# Prompt user for interface
+read -rp "[*] Enter interface for passive monitoring (e.g., eth0): " MONITOR_IFACE
+MONITOR_IFACE="${MONITOR_IFACE:-eth0}"
 
-# Zeek
+# Zeek Compose
 cat > "$PASSIVE_DIR/zeek-compose.yml" <<EOF
-version: '3.9'
 services:
   zeek:
-    image: blacktop/zeek:latest
+    image: zeek/zeek:5.1
     container_name: zeek
     network_mode: host
-    command: zeek -i $USER_IFACE
+    command: zeek -i $MONITOR_IFACE
     restart: unless-stopped
 EOF
 
-# Suricata
+# Suricata Compose
 cat > "$PASSIVE_DIR/suricata-compose.yml" <<EOF
-version: '3.9'
 services:
   suricata:
     image: jasonish/suricata:latest
     container_name: suricata
     network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_NICE
     restart: unless-stopped
 EOF
 
-# Ntopng
+# Ntopng Compose
 cat > "$PASSIVE_DIR/ntopng-compose.yml" <<EOF
-version: '3.9'
 services:
   ntopng:
     image: ntop/ntopng:latest
@@ -294,13 +297,17 @@ services:
     restart: unless-stopped
 EOF
 
-docker pull blacktop/zeek:latest || echo "[!] Zeek image pull failed"
+echo "[*] Pulling passive traffic images..."
+docker pull zeek/zeek:5.1 || echo "[!] Zeek image pull failed"
 docker pull jasonish/suricata:latest || echo "[!] Suricata image pull failed"
 docker pull ntop/ntopng:latest || echo "[!] Ntopng image pull failed"
 
-docker compose -f "$PASSIVE_DIR/zeek-compose.yml" up -d || true
-docker compose -f "$PASSIVE_DIR/suricata-compose.yml" up -d || true
-docker compose -f "$PASSIVE_DIR/ntopng-compose.yml" up -d || true
+echo "[*] Starting passive traffic containers..."
+docker compose -f "$PASSIVE_DIR/zeek-compose.yml" up -d
+docker compose -f "$PASSIVE_DIR/suricata-compose.yml" up -d
+docker compose -f "$PASSIVE_DIR/ntopng-compose.yml" up -d
+
+echo "[*] Passive traffic Phase complete: Zeek, Suricata, Ntopng running on $MONITOR_IFACE"
 phase_summary 5
 
 # -------------------------------
