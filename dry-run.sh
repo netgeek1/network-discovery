@@ -1,14 +1,14 @@
 #!/bin/bash
 # ====================================================
-# Network Mapping Orchestrator — Version 1.3.5
+# Network Mapping Orchestrator — Version 1.3.6
 # Fully Dockerized | Auto-Elevating | Dry-Run First
-# NetBox uses LibreNMS MariaDB
+# NetBox uses LibreNMS MariaDB + dedicated Redis
 # SECRET_KEY auto-generated and safely quoted
 # ====================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.3.5"
+SCRIPT_VERSION="1.3.6"
 echo "[*] Network Mapping Orchestrator — Version $SCRIPT_VERSION"
 
 # -------------------------------
@@ -125,7 +125,7 @@ done
 echo "[*] MariaDB is ready for root connections"
 
 # -------------------------------
-# Phase 1: NetBox Skeleton
+# Phase 1: NetBox Skeleton with Redis
 # -------------------------------
 NETBOX_DIR="$BASE_DIR/netbox"
 mkdir -p "$NETBOX_DIR"
@@ -146,10 +146,19 @@ DB_WAIT_ATTEMPTS=30
 DB_WAIT_SLEEP=5
 DB_WAIT_DEBUG=1
 SECRET_KEY=${NETBOX_SECRET_ESCAPED}
+REDIS_HOST=redis
+REDIS_PORT=6379
 EOF
 
 cat > "$NETBOX_DIR/docker-compose.yml" <<'EOF'
 services:
+  redis:
+    image: redis:7
+    container_name: netbox-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
   netbox:
     image: netboxcommunity/netbox:latest
     container_name: netbox
@@ -159,6 +168,8 @@ services:
       - "8000:8080"
     volumes:
       - ./netbox-data:/opt/netbox/netbox/media
+    depends_on:
+      - redis
     restart: unless-stopped
 EOF
 
@@ -174,7 +185,7 @@ FLUSH PRIVILEGES;
 SQL"
 
 docker pull netboxcommunity/netbox:latest
-docker compose -f "$NETBOX_DIR/docker-compose.yml" up -d netbox
+docker compose -f "$NETBOX_DIR/docker-compose.yml" up -d redis netbox
 phase_summary 1
 
 # -------------------------------
