@@ -223,7 +223,28 @@ phase_summary 6
 PASSIVE_SERVICES=("zeek" "ntopng" "suricata")
 for svc in "${PASSIVE_SERVICES[@]}"; do
   mkdir -p "$BASE_DIR/passive/$svc"
-  cat > "$BASE_DIR/passive/$svc/docker-compose.yml" <<EOF
+  
+  case $svc in
+    zeek)
+      # Official Zeek image with host networking & required capabilities
+      cat > "$BASE_DIR/passive/zeek/docker-compose.yml" <<'EOF'
+version: '3.8'
+services:
+  zeek:
+    image: zeek/zeek:latest
+    container_name: zeek
+    network_mode: host
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    volumes:
+      - ./zeek-scripts:/zeek/scripts
+    command: ["zeek", "-i", "eth0"] # change eth0 to your capture interface
+    restart: unless-stopped
+EOF
+      ;;
+    ntopng|suricata)
+      cat > "$BASE_DIR/passive/$svc/docker-compose.yml" <<EOF
 version: '3.8'
 services:
   $svc:
@@ -233,8 +254,16 @@ services:
       - ./data:/data
     restart: unless-stopped
 EOF
+      ;;
+  esac
+
   echo "[*] Pulling $svc Docker image..."
-  docker pull ${svc}:latest || echo "[!] Image $svc not found locally, skipping..."
+  if [[ $svc == "zeek" ]]; then
+    docker pull zeek/zeek:latest
+  else
+    docker pull ${svc}:latest || echo "[!] Image $svc not found locally, skipping..."
+  fi
+
   echo "[*] Starting $svc..."
   docker compose -f "$BASE_DIR/passive/$svc/docker-compose.yml" up -d
 done
