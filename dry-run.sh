@@ -1,13 +1,14 @@
 #!/bin/bash
 # ====================================================
-# Network Mapping Orchestrator — Version 1.2.0
+# Network Mapping Orchestrator — Version 1.3.0
 # Phases 0 → 8
 # Fully Dockerized | Auto-Elevating | Dry-Run First
+# NetBox uses LibreNMS MariaDB
 # ====================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 echo "[*] Network Mapping Orchestrator — Version $SCRIPT_VERSION"
 
 # -------------------------------
@@ -51,40 +52,7 @@ EOF
 phase_summary 0
 
 # -------------------------------
-# Phase 1: NetBox Skeleton
-# -------------------------------
-mkdir -p "$BASE_DIR/netbox"
-cat > "$BASE_DIR/netbox/docker-compose.yml" <<'EOF'
-services:
-  netbox:
-    image: netboxcommunity/netbox:latest
-    container_name: netbox
-    env_file:
-      - netbox.env
-    volumes:
-      - ./netbox-data:/opt/netbox/netbox/media
-    ports:
-      - "8000:8080"
-    restart: unless-stopped
-EOF
-
-cat > "$BASE_DIR/netbox/netbox.env" <<'EOF'
-ALLOWED_HOSTS=*
-DB_NAME=netbox
-DB_USER=netbox
-DB_PASSWORD=netbox123
-DB_HOST=netbox-db
-DB_PORT=5432
-EOF
-
-echo "[*] Pulling NetBox Docker image..."
-docker pull netboxcommunity/netbox:latest
-echo "[*] Starting NetBox..."
-docker compose -f "$BASE_DIR/netbox/docker-compose.yml" up -d
-phase_summary 1
-
-# -------------------------------
-# Phase 2 & 3: LibreNMS Discovery Stack
+# Phase 2 & 3: LibreNMS Database & Discovery Stack
 # -------------------------------
 LIBRENMS_DIR="$BASE_DIR/librenms"
 mkdir -p "$LIBRENMS_DIR"
@@ -139,8 +107,57 @@ docker pull mariadb:10.11
 docker pull redis:7
 
 echo "[*] Starting LibreNMS stack..."
-docker compose -f "$LIBRENMS_DIR/docker-compose.yml" up -d
+docker compose -f "$LIBRENMS_DIR/docker-compose.yml" up -d db redis librenms
 phase_summary "2 & 3 (LibreNMS)"
+
+# -------------------------------
+# Phase 1: NetBox Skeleton (After DB)
+# -------------------------------
+NETBOX_DIR="$BASE_DIR/netbox"
+mkdir -p "$NETBOX_DIR"
+
+cat > "$NETBOX_DIR/docker-compose.yml" <<'EOF'
+services:
+  netbox:
+    image: netboxcommunity/netbox:latest
+    container_name: netbox
+    env_file:
+      - netbox.env
+    depends_on:
+      - db
+    ports:
+      - "8000:8080"
+    volumes:
+      - ./netbox-data:/opt/netbox/netbox/media
+    restart: unless-stopped
+EOF
+
+cat > "$NETBOX_DIR/netbox.env" <<EOF
+ALLOWED_HOSTS=*
+DB_NAME=netbox
+DB_USER=netbox
+DB_PASSWORD=netbox123
+DB_HOST=db
+DB_PORT=3306
+DB_WAIT_ATTEMPTS=30
+DB_WAIT_SLEEP=5
+DB_WAIT_DEBUG=1
+EOF
+
+echo "[*] Creating NetBox DB and user in LibreNMS MariaDB..."
+docker exec -i librenms-db mysql -uroot -prootpassword <<EOF
+CREATE DATABASE IF NOT EXISTS netbox CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+CREATE USER IF NOT EXISTS 'netbox'@'%' IDENTIFIED BY 'netbox123';
+GRANT ALL PRIVILEGES ON netbox.* TO 'netbox'@'%';
+FLUSH PRIVILEGES;
+EOF
+
+echo "[*] Pulling NetBox Docker image..."
+docker pull netboxcommunity/netbox:latest
+
+echo "[*] Starting NetBox..."
+docker compose -f "$NETBOX_DIR/docker-compose.yml" up -d netbox
+phase_summary 1
 
 # -------------------------------
 # Phase 4: Ingestion Engine (Dry-Run)
