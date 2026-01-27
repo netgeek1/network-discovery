@@ -21,10 +21,11 @@ auto_elevate() {
 auto_elevate "$@"
 
 # -------------------------------
-# Base Directory
+# Prompt for Base Directory
 # -------------------------------
-BASE_DIR="/opt/nautobot-docker"
-echo "[*] Creating base directory at $BASE_DIR..."
+read -rp "Enter base directory for deployment [/opt/netbox-discovery]: " USER_BASE_DIR
+BASE_DIR="${USER_BASE_DIR:-/opt/netbox-discovery}"
+echo "[*] Using base directory: $BASE_DIR"
 mkdir -p "$BASE_DIR"
 
 # -------------------------------
@@ -87,6 +88,7 @@ phase_summary 1
 LIBRENMS_DIR="$BASE_DIR/librenms"
 mkdir -p "$LIBRENMS_DIR"
 
+# docker-compose.yml
 cat > "$LIBRENMS_DIR/docker-compose.yml" <<'EOF'
 version: '3.8'
 
@@ -123,6 +125,7 @@ services:
     restart: unless-stopped
 EOF
 
+# librenms.env
 cat > "$LIBRENMS_DIR/librenms.env" <<EOF
 APP_KEY=$(openssl rand -base64 32)
 BASE_URL=http://localhost:8001
@@ -145,12 +148,28 @@ phase_summary "2 & 3 (LibreNMS)"
 # -------------------------------
 # Phase 4: Ingestion Engine (Dry-Run)
 # -------------------------------
-mkdir -p "$BASE_DIR/ingestion/{collect,normalize,reconcile,commit,logs,config}"
-cat > "$BASE_DIR/ingestion/docker-compose.yml" <<'EOF'
+INGESTION_DIR="$BASE_DIR/ingestion"
+mkdir -p "$INGESTION_DIR"/{collect,normalize,reconcile,commit,logs,config}
+
+# Dockerfile for ingestion
+cat > "$INGESTION_DIR/Dockerfile" <<'EOF'
+FROM python:3.12-slim
+WORKDIR /app
+COPY collect/ collect/
+COPY normalize/ normalize/
+COPY reconcile/ reconcile/
+COPY commit/ commit/
+COPY config/ config/
+RUN pip install requests pyyaml
+CMD ["bash", "-c", "echo 'Ingestion engine placeholder — implement your logic here' && sleep infinity"]
+EOF
+
+# docker-compose.yml using local build
+cat > "$INGESTION_DIR/docker-compose.yml" <<'EOF'
 version: '3.8'
 services:
   ingestion:
-    image: ingestion:latest
+    build: .
     container_name: ingestion
     env_file:
       - ingestion.env
@@ -160,16 +179,18 @@ services:
     restart: unless-stopped
 EOF
 
-cat > "$BASE_DIR/ingestion/ingestion.env" <<EOF
+# env file for ingestion
+cat > "$INGESTION_DIR/ingestion.env" <<EOF
 MODE=dry-run
 NETBOX_URL=http://netbox:8080
 NETBOX_TOKEN=changeme
 EOF
 
-echo "[*] Pulling ingestion image..."
-docker pull ingestion:latest || echo "[!] Image ingestion not found locally, skipping..."
-echo "[*] Starting ingestion engine in dry-run mode..."
-docker compose -f "$BASE_DIR/ingestion/docker-compose.yml" up -d
+echo "[*] Building local ingestion Docker image..."
+docker compose -f "$INGESTION_DIR/docker-compose.yml" build
+
+echo "[*] Starting ingestion engine (dry-run)..."
+docker compose -f "$INGESTION_DIR/docker-compose.yml" up -d
 phase_summary 4
 
 # -------------------------------
