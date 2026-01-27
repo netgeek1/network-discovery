@@ -1,13 +1,13 @@
 #!/bin/bash
 # ====================================================
-# Network Mapping Orchestrator — Version 1.1.2
+# Network Mapping Orchestrator — Version 1.2.0
 # Phases 0 → 8
 # Fully Dockerized | Auto-Elevating | Dry-Run First
 # ====================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.1.2"
+SCRIPT_VERSION="1.2.0"
 echo "[*] Network Mapping Orchestrator — Version $SCRIPT_VERSION"
 
 # -------------------------------
@@ -148,7 +148,6 @@ phase_summary "2 & 3 (LibreNMS)"
 INGESTION_DIR="$BASE_DIR/ingestion"
 mkdir -p "$INGESTION_DIR"/{collect,normalize,reconcile,commit,logs,config}
 
-# Dockerfile for ingestion
 cat > "$INGESTION_DIR/Dockerfile" <<'EOF'
 FROM python:3.12-slim
 WORKDIR /app
@@ -161,7 +160,6 @@ RUN pip install requests pyyaml
 CMD ["bash", "-c", "echo 'Ingestion engine placeholder — implement your logic here' && sleep infinity"]
 EOF
 
-# docker-compose.yml using local build
 cat > "$INGESTION_DIR/docker-compose.yml" <<'EOF'
 services:
   ingestion:
@@ -175,7 +173,6 @@ services:
     restart: unless-stopped
 EOF
 
-# env file for ingestion
 cat > "$INGESTION_DIR/ingestion.env" <<EOF
 MODE=dry-run
 NETBOX_URL=http://netbox:8080
@@ -190,7 +187,7 @@ docker compose -f "$INGESTION_DIR/docker-compose.yml" up -d
 phase_summary 4
 
 # -------------------------------
-# Phase 5: Promotion & Controlled Writes (Placeholder)
+# Phase 5: Promotion & Controlled Writes
 # -------------------------------
 mkdir -p "$BASE_DIR/promotion"
 touch "$BASE_DIR/promotion/promote.sh"
@@ -252,8 +249,8 @@ services:
 EOF
       docker pull ntop/ntopng:latest
       ;;
-suricata)
-  cat > "$BASE_DIR/passive/suricata/docker-compose.yml" <<'EOF'
+    suricata)
+      cat > "$BASE_DIR/passive/suricata/docker-compose.yml" <<'EOF'
 services:
   suricata:
     image: jasonish/suricata:latest
@@ -268,10 +265,9 @@ services:
       - ./suricata-logs:/var/log/suricata
     restart: unless-stopped
 EOF
-  echo "[*] Pulling Suricata Docker image..."
-  docker pull jasonish/suricata:latest
-  ;;
-esac
+      docker pull jasonish/suricata:latest
+      ;;
+  esac
 
   echo "[*] Starting $svc..."
   docker compose -f "$BASE_DIR/passive/$svc/docker-compose.yml" up -d
