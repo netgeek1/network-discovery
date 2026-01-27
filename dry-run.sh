@@ -1,39 +1,32 @@
 #!/bin/bash
 # ====================================================
-# Network Mapping Orchestrator — Version 1.3.6
+# Network Mapping Orchestrator — Version 1.3.7
 # Fully Dockerized | Auto-Elevating | Dry-Run First
-# NetBox uses LibreNMS MariaDB + dedicated Redis
-# SECRET_KEY auto-generated and safely quoted
+# Phases 0 → 8 | NetBox uses LibreNMS MariaDB + Redis
 # ====================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.3.6"
+SCRIPT_VERSION="1.3.7"
 echo "[*] Network Mapping Orchestrator — Version $SCRIPT_VERSION"
 
 # -------------------------------
-# Auto-Elevate
+# Auto-elevate
 # -------------------------------
-auto_elevate() {
-  if [[ $EUID -ne 0 ]]; then
+if [[ $EUID -ne 0 ]]; then
     echo "[*] Elevation required. Re-running as root..."
     exec sudo bash "$0" "$@"
     exit 0
-  fi
-}
-auto_elevate "$@"
+fi
 
 # -------------------------------
-# Prompt for Base Directory
+# Base Directory Prompt
 # -------------------------------
 read -rp "Enter base directory for deployment [/opt/netbox-docker]: " USER_BASE_DIR
 BASE_DIR="${USER_BASE_DIR:-/opt/netbox-docker}"
 mkdir -p "$BASE_DIR"
 echo "[*] Using base directory: $BASE_DIR"
 
-# -------------------------------
-# Function: Phase Summary
-# -------------------------------
 phase_summary() {
   echo
   echo "===================================================="
@@ -52,12 +45,13 @@ EOF
 phase_summary 0
 
 # -------------------------------
-# Phase 2 & 3: LibreNMS DB
+# Phase 2 & 3: LibreNMS
 # -------------------------------
 LIBRENMS_DIR="$BASE_DIR/librenms"
 mkdir -p "$LIBRENMS_DIR"
 
 cat > "$LIBRENMS_DIR/docker-compose.yml" <<'EOF'
+version: '3.8'
 services:
   db:
     image: mariadb:10.11
@@ -98,7 +92,7 @@ DB_PASSWORD=librenmspass
 REDIS_HOST=redis
 EOF
 
-echo "[*] Pulling LibreNMS, MariaDB, and Redis images..."
+echo "[*] Pulling LibreNMS images..."
 docker pull librenms/librenms:latest
 docker pull mariadb:10.11
 docker pull redis:7
@@ -107,33 +101,29 @@ echo "[*] Starting LibreNMS stack..."
 docker compose -f "$LIBRENMS_DIR/docker-compose.yml" up -d db redis librenms
 phase_summary "2 & 3 (LibreNMS)"
 
-# -------------------------------
 # Wait for MariaDB readiness
-# -------------------------------
-echo "[*] Waiting for MariaDB to accept root connections..."
+echo "[*] Waiting for MariaDB root connection..."
 MAX_RETRIES=30
 COUNT=0
 until docker exec librenms-db mysql -uroot -prootpassword -e "SELECT 1;" &>/dev/null; do
     COUNT=$((COUNT+1))
     if [ $COUNT -ge $MAX_RETRIES ]; then
-        echo "[!] MariaDB did not become ready in time. Exiting."
+        echo "[!] MariaDB did not become ready. Exiting."
         exit 1
     fi
     echo "[*] MariaDB not ready yet... retry $COUNT/$MAX_RETRIES"
     sleep 2
 done
-echo "[*] MariaDB is ready for root connections"
+echo "[*] MariaDB ready"
 
 # -------------------------------
-# Phase 1: NetBox Skeleton with Redis
+# Phase 1: NetBox Skeleton + Redis + LibreNMS Network
 # -------------------------------
 NETBOX_DIR="$BASE_DIR/netbox"
 mkdir -p "$NETBOX_DIR"
 
-# Auto-generate SECRET_KEY and safely quote it
 NETBOX_SECRET=$(openssl rand -base64 64)
 NETBOX_SECRET_ESCAPED="\"${NETBOX_SECRET}\""
-echo "[*] Generated NetBox SECRET_KEY (safely quoted)"
 
 cat > "$NETBOX_DIR/netbox.env" <<EOF
 ALLOWED_HOSTS=*
@@ -150,7 +140,8 @@ REDIS_HOST=redis
 REDIS_PORT=6379
 EOF
 
-cat > "$NETBOX_DIR/docker-compose.yml" <<'EOF'
+cat > "$NETBOX_DIR/docker-compose.yml" <<EOF
+version: '3.8'
 services:
   redis:
     image: redis:7
@@ -171,18 +162,36 @@ services:
     depends_on:
       - redis
     restart: unless-stopped
+
+networks:
+  default:
+    external:
+      name: librenms_default
 EOF
 
-# -------------------------------
-# Create NetBox DB & User inside MariaDB container
-# -------------------------------
-echo "[*] Creating NetBox database and user inside LibreNMS MariaDB..."
+# Create NetBox DB & User inside LibreNMS MariaDB
 docker exec -i librenms-db sh -c "mysql -uroot -prootpassword <<SQL
 CREATE DATABASE IF NOT EXISTS netbox CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
 CREATE USER IF NOT EXISTS 'netbox'@'%' IDENTIFIED BY 'netbox123';
 GRANT ALL PRIVILEGES ON netbox.* TO 'netbox'@'%';
 FLUSH PRIVILEGES;
 SQL"
+
+# Wait for NetBox DB connection
+echo "[*] Waiting for NetBox DB connection..."
+COUNT=0
+MAX_RETRIES=30
+until docker run --rm --network=librenms_default mariadb:10.11 \
+    mysql -h db -unetbox -pnetbox123 -e "SELECT 1;" &>/dev/null; do
+    COUNT=$((COUNT+1))
+    if [ $COUNT -ge $MAX_RETRIES ]; then
+        echo "[!] NetBox DB connection failed after $MAX_RETRIES attempts. Exiting."
+        exit 1
+    fi
+    echo "[*] DB not ready, retry $COUNT/$MAX_RETRIES..."
+    sleep 2
+done
+echo "[*] NetBox DB ready"
 
 docker pull netboxcommunity/netbox:latest
 docker compose -f "$NETBOX_DIR/docker-compose.yml" up -d redis netbox
@@ -203,7 +212,7 @@ COPY reconcile/ reconcile/
 COPY commit/ commit/
 COPY config/ config/
 RUN pip install requests pyyaml
-CMD ["bash", "-c", "echo 'Ingestion engine placeholder — implement your logic here' && sleep infinity"]
+CMD ["bash", "-c", "echo 'Ingestion engine placeholder' && sleep infinity"]
 EOF
 
 cat > "$INGESTION_DIR/docker-compose.yml" <<'EOF'
@@ -230,15 +239,19 @@ docker compose -f "$INGESTION_DIR/docker-compose.yml" up -d
 phase_summary 4
 
 # -------------------------------
-# Phase 5: Promotion & Controlled Writes
+# Phase 5: Promotion Scripts
 # -------------------------------
-mkdir -p "$BASE_DIR/promotion"
-touch "$BASE_DIR/promotion/promote.sh"
-chmod +x "$BASE_DIR/promotion/promote.sh"
+PROMOTE_DIR="$BASE_DIR/promotion"
+mkdir -p "$PROMOTE_DIR"
+cat > "$PROMOTE_DIR/promote.sh" <<'EOF'
+#!/bin/bash
+echo "[*] Promotion placeholder — implement your promotion rules"
+EOF
+chmod +x "$PROMOTE_DIR/promote.sh"
 phase_summary 5
 
 # -------------------------------
-# Phase 6: Compute & Hypervisors
+# Phase 6: Compute / Hypervisors
 # -------------------------------
 COMPUTE_SERVICES=("proxmox" "hyperv" "kvm" "esxi")
 for svc in "${COMPUTE_SERVICES[@]}"; do
@@ -253,12 +266,11 @@ done
 phase_summary 6
 
 # -------------------------------
-# Phase 7: Passive Traffic Overlay
+# Phase 7: Passive Traffic
 # -------------------------------
 PASSIVE_SERVICES=("zeek" "ntopng" "suricata")
 for svc in "${PASSIVE_SERVICES[@]}"; do
   mkdir -p "$BASE_DIR/passive/$svc"
-  
   case $svc in
     zeek)
       cat > "$BASE_DIR/passive/zeek/docker-compose.yml" <<'EOF'
@@ -310,7 +322,6 @@ EOF
       docker pull jasonish/suricata:latest
       ;;
   esac
-
   docker compose -f "$BASE_DIR/passive/$svc/docker-compose.yml" up -d
 done
 phase_summary 7
@@ -318,13 +329,14 @@ phase_summary 7
 # -------------------------------
 # Phase 8: Completeness & Trust Scoring
 # -------------------------------
-mkdir -p "$BASE_DIR/completeness"
-cat > "$BASE_DIR/completeness/score.sh" <<'EOF'
+COMPLETENESS_DIR="$BASE_DIR/completeness"
+mkdir -p "$COMPLETENESS_DIR"
+cat > "$COMPLETENESS_DIR/score.sh" <<'EOF'
 #!/bin/bash
 echo "[*] Calculating device and network trust scores (dry-run)..."
 EOF
-chmod +x "$BASE_DIR/completeness/score.sh"
-bash "$BASE_DIR/completeness/score.sh"
+chmod +x "$COMPLETENESS_DIR/score.sh"
+bash "$COMPLETENESS_DIR/score.sh"
 phase_summary 8
 
 # -------------------------------
@@ -332,11 +344,7 @@ phase_summary 8
 # -------------------------------
 echo
 echo "===================================================="
-echo "[*] Full Phase 0 → 8 bootstrap completed (dry-run)"
-echo "[*] NetBox SECRET_KEY has been auto-generated and safely quoted"
-echo "[*] Next steps:"
-echo "  1) Populate ingestion logic, promotion rules, scoring algorithms"
-echo "  2) Configure network capture interfaces for passive tools"
-echo "  3) Start full monitoring and data ingestion"
+echo "[*] Orchestrator v1.3.7 bootstrap complete"
+echo "[*] NetBox SECRET_KEY generated and safely quoted"
+echo "[*] Base directory: $BASE_DIR"
 echo "===================================================="
-echo
