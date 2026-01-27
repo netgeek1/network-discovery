@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================
-# Network Mapping Orchestrator — Version 2.0
+# Network Mapping Orchestrator — Version 2.1
 # Fully Dockerized | Auto-Elevating | 8 Phases
 # NetBox uses PostgreSQL | LibreNMS uses MariaDB
 # Includes Ingestion, Passive Traffic, Compute Discovery
@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.0"
+SCRIPT_VERSION="2.1"
 echo "[*] Network Mapping Orchestrator — Version $SCRIPT_VERSION"
 
 # -------------------------------
@@ -40,6 +40,28 @@ phase_summary() {
 }
 
 # -------------------------------
+# Capture Interface Prompt (NEW)
+# -------------------------------
+echo
+echo "[*] Available network interfaces:"
+ip -o link show | awk -F': ' '{print " - " $2}'
+echo
+read -rp "Select capture interface for passive tools (Zeek/Suricata [eth0]): " PASSIVE_IF="${PASSIVE_IF:-eth0}"
+
+if ! ip link show "$PASSIVE_I" &>/dev/null; then
+    echo "[!] Interface '$PASSIVE_IE' does not exist. Exiting."
+    exit 1
+fi
+
+echo "[*] Using interface $PASSIVE_IF for passive traffic capture"
+
+# -------------------------------
+# Orchestrator Docker network
+# -------------------------------
+ORCH_NET="orchestrator_net"
+docker network create "$ORCH_NET" >/dev/null 2>&1 || true
+
+# -------------------------------
 # Phase 0: Define Tags & Config
 # -------------------------------
 PHASE0_DIR="$BASE_DIR/phase0"
@@ -55,7 +77,8 @@ phase_summary 0
 LIBRENMS_DIR="$BASE_DIR/librenms"
 mkdir -p "$LIBRENMS_DIR"
 
-cat > "$LIBRENMS_DIR/docker-compose.yml" <<'EOF'
+cat > "$LIBRENMS_DIR/docker-compose.yml" <<EOF
+version: "3.9"
 services:
   db:
     image: mariadb:10.11
@@ -67,11 +90,15 @@ services:
       MYSQL_PASSWORD: librenmspass
     volumes:
       - ./db-data:/var/lib/mysql
+    networks:
+      - $ORCH_NET
     restart: unless-stopped
 
   redis:
     image: redis:7
     container_name: librenms-redis
+    networks:
+      - $ORCH_NET
     restart: unless-stopped
 
   librenms:
@@ -83,7 +110,13 @@ services:
       - "8001:80"
     volumes:
       - ./data:/data
+    networks:
+      - $ORCH_NET
     restart: unless-stopped
+
+networks:
+  $ORCH_NET:
+    external: true
 EOF
 
 cat > "$LIBRENMS_DIR/librenms.env" <<EOF
@@ -139,10 +172,13 @@ REDIS_PORT=6379
 EOF
 
 cat > "$NETBOX_DIR/docker-compose.yml" <<EOF
+version: "3.9"
 services:
   netbox-redis:
     image: redis:7
     container_name: netbox-redis
+    networks:
+      - $ORCH_NET
     ports:
       - "6379:6379"
     restart: unless-stopped
@@ -156,6 +192,8 @@ services:
       POSTGRES_DB: netbox
     volumes:
       - ./postgres-data:/var/lib/postgresql/data
+    networks:
+      - $ORCH_NET
     restart: unless-stopped
 
   netbox:
@@ -170,33 +208,17 @@ services:
     depends_on:
       - netbox-db
       - netbox-redis
+    networks:
+      - $ORCH_NET
     restart: unless-stopped
 
 networks:
-  default:
-    external:
-      name: librenms_default
+  $ORCH_NET:
+    external: true
 EOF
 
-docker compose -f "$NETBOX_DIR/docker-compose.yml" up -d netbox-redis netbox-db
-phase_summary 1
-
-# Wait for NetBox PostgreSQL readiness
-echo "[*] Waiting for NetBox PostgreSQL..."
-COUNT=0
-until docker exec netbox-db pg_isready -U netbox &>/dev/null; do
-    COUNT=$((COUNT+1))
-    if [ $COUNT -ge $MAX_RETRIES ]; then
-        echo "[!] NetBox PostgreSQL not ready. Exiting."
-        exit 1
-    fi
-    echo "[*] DB not ready, retry $COUNT/$MAX_RETRIES..."
-    sleep 2
-done
-echo "[*] NetBox PostgreSQL ready"
-
 docker pull netboxcommunity/netbox:latest
-docker compose -f "$NETBOX_DIR/docker-compose.yml" up -d netbox
+docker compose -f "$NETBOX_DIR/docker-compose.yml" up -d netbox-redis netbox-db netbox
 phase_summary 1
 
 # -------------------------------
@@ -204,7 +226,8 @@ phase_summary 1
 # -------------------------------
 OXIDIZED_DIR="$BASE_DIR/oxidized"
 mkdir -p "$OXIDIZED_DIR"
-cat > "$OXIDIZED_DIR/docker-compose.yml" <<'EOF'
+cat > "$OXIDIZED_DIR/docker-compose.yml" <<EOF
+version: "3.9"
 services:
   oxidized:
     image: oxidized/oxidized:latest
@@ -214,7 +237,13 @@ services:
     volumes:
       - ./config:/home/oxidized/.config
       - ./logs:/home/oxidized/logs
+    networks:
+      - $ORCH_NET
     restart: unless-stopped
+
+networks:
+  $ORCH_NET:
+    external: true
 EOF
 docker pull oxidized/oxidized:latest
 docker compose -f "$OXIDIZED_DIR/docker-compose.yml" up -d
@@ -227,32 +256,46 @@ PASSIVE_DIR="$BASE_DIR/passive"
 mkdir -p "$PASSIVE_DIR"
 
 # Zeek
-cat > "$PASSIVE_DIR/zeek-compose.yml" <<'EOF'
+cat > "$PASSIVE_DIR/zeek-compose.yml" <<EOF
+version: "3.9"
 services:
   zeek:
     image: blacktop/zeek:latest
     container_name: zeek
-    network_mode: host
+    network_mode: "host"
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    command: zeek -i $PASSIVE_IF
     restart: unless-stopped
 EOF
 
 # Suricata
-cat > "$PASSIVE_DIR/suricata-compose.yml" <<'EOF'
+cat > "$PASSIVE_DIR/suricata-compose.yml" <<EOF
+version: "3.9"
 services:
   suricata:
-    image: docker.io/jasonish/suricata:latest
+    image: jasonish/suricata:latest
     container_name: suricata
-    network_mode: host
+    network_mode: "host"
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_NICE
+    volumes:
+      - ./rules:/var/lib/suricata/rules
+    command: suricata -i $PASSIVE_IF -c /etc/suricata/suricata.yaml
     restart: unless-stopped
 EOF
 
 # Ntopng
-cat > "$PASSIVE_DIR/ntopng-compose.yml" <<'EOF'
+cat > "$PASSIVE_DIR/ntopng-compose.yml" <<EOF
+version: "3.9"
 services:
   ntopng:
     image: ntop/ntopng:latest
     container_name: ntopng
-    network_mode: host
+    network_mode: "host"
     restart: unless-stopped
 EOF
 
@@ -279,7 +322,7 @@ chmod +x "$COMPUTE_DIR/discovery.sh"
 phase_summary 6
 
 # -------------------------------
-# Phase 7: Ingestion / Dry Run
+# Phase 7: Ingestion / Zeek → NetBox placeholder
 # -------------------------------
 INGEST_DIR="$BASE_DIR/ingestion"
 mkdir -p "$INGEST_DIR"
@@ -287,6 +330,7 @@ cat > "$INGEST_DIR/ingest.sh" <<'EOF'
 #!/bin/bash
 # Placeholder: SNMP, SSH, API ingestion
 echo "[*] Placeholder: Dry-run discovery, validate devices before NetBox write"
+# Placeholder: Zeek -> NetBox ingestion logic goes here
 EOF
 chmod +x "$INGEST_DIR/ingest.sh"
 phase_summary 7
@@ -298,6 +342,6 @@ echo "[*] Phase 8: Validations / Completeness checks"
 echo "[*] Script finished all 8 phases — network skeleton and passive/compute ready"
 phase_summary 8
 
-echo "[*] Orchestrator v2.0 bootstrap complete!"
+echo "[*] Orchestrator v2.1 bootstrap complete!"
 echo "[*] Base directory: $BASE_DIR"
 echo "[*] You can now run ingestion and compute discovery scripts as needed"
