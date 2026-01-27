@@ -1,15 +1,15 @@
 #!/bin/bash
 # ====================================================
-# Network Mapping Orchestrator — Version 1.3.1
+# Network Mapping Orchestrator — Version 1.3.2
 # Phases 0 → 8
 # Fully Dockerized | Auto-Elevating | Dry-Run First
 # NetBox uses LibreNMS MariaDB
-# Includes DB readiness check
+# Manual DB readiness check (no depends_on)
 # ====================================================
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.3.1"
+SCRIPT_VERSION="1.3.2"
 echo "[*] Network Mapping Orchestrator — Version $SCRIPT_VERSION"
 
 # -------------------------------
@@ -80,9 +80,6 @@ services:
   librenms:
     image: librenms/librenms:latest
     container_name: librenms
-    depends_on:
-      - db
-      - redis
     env_file:
       - librenms.env
     ports:
@@ -134,8 +131,6 @@ services:
     container_name: netbox
     env_file:
       - netbox.env
-    depends_on:
-      - db
     ports:
       - "8000:8080"
     volumes:
