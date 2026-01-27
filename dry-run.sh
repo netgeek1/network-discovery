@@ -46,10 +46,11 @@ echo
 echo "[*] Available network interfaces:"
 ip -o link show | awk -F': ' '{print " - " $2}'
 echo
-read -rp "Select capture interface for passive tools (Zeek/Suricata [eth0]): " PASSIVE_IF="${PASSIVE_IF:-eth0}"
+read -rp "Select capture interface for passive tools (Zeek/Suricata [eth0]): " PASSIVE_IF
+PASSIVE_IF="${PASSIVE_IF:-eth0}"
 
-if ! ip link show "$PASSIVE_I" &>/dev/null; then
-    echo "[!] Interface '$PASSIVE_IE' does not exist. Exiting."
+if ! ip link show "$PASSIVE_IF" &>/dev/null; then
+    echo "[!] Interface '$PASSIVE_IF' does not exist. Exiting."
     exit 1
 fi
 
@@ -72,13 +73,82 @@ EOF
 phase_summary 0
 
 # -------------------------------
+# Phase 1: NetBox Skeleton + PostgreSQL + Redis
+# -------------------------------
+NETBOX_DIR="$BASE_DIR/netbox"
+mkdir -p "$NETBOX_DIR"
+
+NETBOX_SECRET=$(openssl rand -base64 64)
+NETBOX_SECRET_ESCAPED="\"${NETBOX_SECRET}\""
+
+cat > "$NETBOX_DIR/netbox.env" <<EOF
+ALLOWED_HOSTS=*
+DB_NAME=netbox
+DB_USER=netbox
+DB_PASSWORD=netbox123
+DB_HOST=netbox-db
+DB_PORT=5432
+SECRET_KEY=${NETBOX_SECRET_ESCAPED}
+REDIS_HOST=netbox-redis
+REDIS_PORT=6379
+EOF
+
+cat > "$NETBOX_DIR/docker-compose.yml" <<EOF
+services:
+  netbox-redis:
+    image: redis:7
+    container_name: netbox-redis
+    networks:
+      - $ORCH_NET
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  netbox-db:
+    image: postgres:15
+    container_name: netbox-db
+    environment:
+      POSTGRES_USER: netbox
+      POSTGRES_PASSWORD: netbox123
+      POSTGRES_DB: netbox
+    volumes:
+      - ./postgres-data:/var/lib/postgresql/data
+    networks:
+      - $ORCH_NET
+    restart: unless-stopped
+
+  netbox:
+    image: netboxcommunity/netbox:latest
+    container_name: netbox
+    env_file:
+      - netbox.env
+    ports:
+      - "8000:8080"
+    volumes:
+      - ./netbox-data:/opt/netbox/netbox/media
+    depends_on:
+      - netbox-db
+      - netbox-redis
+    networks:
+      - $ORCH_NET
+    restart: unless-stopped
+
+networks:
+  $ORCH_NET:
+    external: true
+EOF
+
+docker pull netboxcommunity/netbox:latest
+docker compose -f "$NETBOX_DIR/docker-compose.yml" up -d netbox-redis netbox-db netbox
+phase_summary 1
+
+# -------------------------------
 # Phase 2 & 3: LibreNMS
 # -------------------------------
 LIBRENMS_DIR="$BASE_DIR/librenms"
 mkdir -p "$LIBRENMS_DIR"
 
 cat > "$LIBRENMS_DIR/docker-compose.yml" <<EOF
-version: "3.9"
 services:
   db:
     image: mariadb:10.11
@@ -133,7 +203,6 @@ docker pull librenms/librenms:latest
 docker pull mariadb:10.11
 docker pull redis:7
 docker compose -f "$LIBRENMS_DIR/docker-compose.yml" up -d db redis librenms
-phase_summary "2 & 3 (LibreNMS)"
 
 # Wait for MariaDB readiness
 echo "[*] Waiting for LibreNMS MariaDB..."
@@ -150,76 +219,7 @@ until docker exec librenms-db mysql -uroot -prootpassword -e "SELECT 1;" &>/dev/
 done
 echo "[*] LibreNMS MariaDB ready"
 
-# -------------------------------
-# Phase 1: NetBox Skeleton + PostgreSQL + Redis
-# -------------------------------
-NETBOX_DIR="$BASE_DIR/netbox"
-mkdir -p "$NETBOX_DIR"
-
-NETBOX_SECRET=$(openssl rand -base64 64)
-NETBOX_SECRET_ESCAPED="\"${NETBOX_SECRET}\""
-
-cat > "$NETBOX_DIR/netbox.env" <<EOF
-ALLOWED_HOSTS=*
-DB_NAME=netbox
-DB_USER=netbox
-DB_PASSWORD=netbox123
-DB_HOST=netbox-db
-DB_PORT=5432
-SECRET_KEY=${NETBOX_SECRET_ESCAPED}
-REDIS_HOST=netbox-redis
-REDIS_PORT=6379
-EOF
-
-cat > "$NETBOX_DIR/docker-compose.yml" <<EOF
-version: "3.9"
-services:
-  netbox-redis:
-    image: redis:7
-    container_name: netbox-redis
-    networks:
-      - $ORCH_NET
-    ports:
-      - "6379:6379"
-    restart: unless-stopped
-
-  netbox-db:
-    image: postgres:15
-    container_name: netbox-db
-    environment:
-      POSTGRES_USER: netbox
-      POSTGRES_PASSWORD: netbox123
-      POSTGRES_DB: netbox
-    volumes:
-      - ./postgres-data:/var/lib/postgresql/data
-    networks:
-      - $ORCH_NET
-    restart: unless-stopped
-
-  netbox:
-    image: netboxcommunity/netbox:latest
-    container_name: netbox
-    env_file:
-      - netbox.env
-    ports:
-      - "8000:8080"
-    volumes:
-      - ./netbox-data:/opt/netbox/netbox/media
-    depends_on:
-      - netbox-db
-      - netbox-redis
-    networks:
-      - $ORCH_NET
-    restart: unless-stopped
-
-networks:
-  $ORCH_NET:
-    external: true
-EOF
-
-docker pull netboxcommunity/netbox:latest
-docker compose -f "$NETBOX_DIR/docker-compose.yml" up -d netbox-redis netbox-db netbox
-phase_summary 1
+phase_summary "2 & 3 (LibreNMS)"
 
 # -------------------------------
 # Phase 4: Oxidized + Git
@@ -227,7 +227,6 @@ phase_summary 1
 OXIDIZED_DIR="$BASE_DIR/oxidized"
 mkdir -p "$OXIDIZED_DIR"
 cat > "$OXIDIZED_DIR/docker-compose.yml" <<EOF
-version: "3.9"
 services:
   oxidized:
     image: oxidized/oxidized:latest
@@ -257,7 +256,6 @@ mkdir -p "$PASSIVE_DIR"
 
 # Zeek
 cat > "$PASSIVE_DIR/zeek-compose.yml" <<EOF
-version: "3.9"
 services:
   zeek:
     image: blacktop/zeek:latest
@@ -272,7 +270,6 @@ EOF
 
 # Suricata
 cat > "$PASSIVE_DIR/suricata-compose.yml" <<EOF
-version: "3.9"
 services:
   suricata:
     image: jasonish/suricata:latest
@@ -290,7 +287,6 @@ EOF
 
 # Ntopng
 cat > "$PASSIVE_DIR/ntopng-compose.yml" <<EOF
-version: "3.9"
 services:
   ntopng:
     image: ntop/ntopng:latest
