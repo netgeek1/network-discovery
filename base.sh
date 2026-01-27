@@ -17,6 +17,14 @@ auto_elevate() {
 
 auto_elevate "$@"
 
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+log()  { echo "[INFO] $*"; }
+warn() { echo "[WARN] $*" >&2; }
+err()  { echo "[ERROR] $*" >&2; }
+pause(){ read -rp "Press ENTER to continue..."; }
+
 # -------------------------------
 # Base Directory
 # -------------------------------
@@ -157,22 +165,40 @@ echo "Calculating device and network trust scores..."
 EOF
 chmod +x "$BASE_DIR/completeness/score.sh"
 
-# -------------------------------
-# Docker Installation if Missing
-# -------------------------------
-if ! command -v docker &> /dev/null; then
-  echo "[*] Docker not found. Installing..."
-  curl -fsSL https://get.docker.com -o get-docker.sh
-  sh get-docker.sh
-  rm get-docker.sh
-fi
+# ------------------------------------------------------------
+# Docker install & prerequisites (Ubuntu/Debian)
+# ------------------------------------------------------------
+install_docker() {
+  command -v docker >/dev/null 2>&1 && return
+  log "Docker not found; installing prerequisites + Docker Engine..."
 
-if ! command -v docker-compose &> /dev/null; then
-  echo "[*] Docker Compose not found. Installing..."
-  DOCKER_COMPOSE_VER="2.20.2"
-  curl -L "https://github.com/docker/compose/releases/download/v${DOCKER_COMPOSE_VER}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-  chmod +x /usr/local/bin/docker-compose
-fi
+  apt-get update
+  apt-get install -y ca-certificates curl gnupg lsb-release openssl
+
+  mkdir -p /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  chmod a+r /etc/apt/keyrings/docker.gpg
+
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
+
+  apt-get update
+  apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+
+  systemctl enable docker
+  systemctl start docker
+
+  log "Docker installed."
+}
+
+ensure_docker_group() {
+  getent group docker >/dev/null || groupadd docker
+  if ! id "$REAL_USER" | grep -q docker; then
+    log "Adding user '$REAL_USER' to docker group"
+    usermod -aG docker "$REAL_USER"
+    warn "You may need to log out/in for group changes to apply in existing sessions."
+    exit
+  fi
+}
 
 # -------------------------------
 # Summary
