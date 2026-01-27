@@ -203,6 +203,8 @@ ensure_docker_group() {
 # -------------------------------
 # Summary
 # -------------------------------
+install_docker
+ensure_docker_group
 echo "[*] Deployment skeleton created at $BASE_DIR"
 echo "[*] Phase directories:"
 ls -1 "$BASE_DIR"
