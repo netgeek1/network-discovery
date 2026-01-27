@@ -6,8 +6,10 @@
 
 set -euo pipefail
 
+SCRIPT_VERSION="1.1"
+
 echo "=============================="
-echo " Full Stack Diagnostic"
+echo " Full Stack Diagnostic - Version $SCRIPT_VERSION"
 echo "=============================="
 echo
 
@@ -59,8 +61,12 @@ docker ps --filter "name=netbox"
 NETBOX_CID=$(docker ps --format '{{.ID}} {{.Names}}' | grep -i netbox | awk '{print $1}' || true)
 if [[ -n "$NETBOX_CID" ]]; then
   echo "[*] Resolving DB and Redis inside NetBox"
-  docker exec "$NETBOX_CID" getent hosts netbox-db || echo "❌ Cannot resolve netbox-db"
-  docker exec "$NETBOX_CID" getent hosts netbox-redis || echo "❌ Cannot resolve netbox-redis"
+
+  # DB test
+  docker exec -it "$NETBOX_CID" bash -c "apt-get update >/dev/null 2>&1 && apt-get install -y postgresql-client >/dev/null 2>&1 && PGPASSWORD=netbox123 psql -h netbox-db -U netbox -d netbox -c '\l'" || echo "❌ Cannot resolve netbox-db"
+
+  # Redis test
+  docker exec -it "$NETBOX_CID" -c "apt-get update >/dev/null 2>&1 && apt-get install -y redis-tools >/dev/null 2>&1 && redis-cli -h netbox-redis ping"
 
   echo "[*] Test DB connectivity"
   docker exec "$NETBOX_CID" python3 - <<'EOF' || true
@@ -127,5 +133,5 @@ echo "[*] Ingestion script status"
 echo
 
 echo "=============================="
-echo " Diagnostic complete"
+echo " Diagnostic complete - Version $SCRIPT_VERSION"
 echo "=============================="
