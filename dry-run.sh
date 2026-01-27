@@ -40,29 +40,6 @@ phase_summary() {
 }
 
 # -------------------------------
-# Capture Interface Prompt (NEW)
-# -------------------------------
-echo
-echo "[*] Available network interfaces:"
-ip -o link show | awk -F': ' '{print " - " $2}'
-echo
-read -rp "Select capture interface for passive tools (Zeek/Suricata [eth0]): " PASSIVE_IF
-PASSIVE_IF="${PASSIVE_IF:-eth0}"
-
-if ! ip link show "$PASSIVE_IF" &>/dev/null; then
-    echo "[!] Interface '$PASSIVE_IF' does not exist. Exiting."
-    exit 1
-fi
-
-echo "[*] Using interface $PASSIVE_IF for passive traffic capture"
-
-# -------------------------------
-# Orchestrator Docker network
-# -------------------------------
-ORCH_NET="orchestrator_net"
-docker network create "$ORCH_NET" >/dev/null 2>&1 || true
-
-# -------------------------------
 # Phase 0: Define Tags & Config
 # -------------------------------
 PHASE0_DIR="$BASE_DIR/phase0"
@@ -94,14 +71,11 @@ REDIS_PORT=6379
 EOF
 
 cat > "$NETBOX_DIR/docker-compose.yml" <<EOF
+version: '3.9'
 services:
   netbox-redis:
     image: redis:7
     container_name: netbox-redis
-    networks:
-      - $ORCH_NET
-    ports:
-      - "6379:6379"
     restart: unless-stopped
 
   netbox-db:
@@ -113,8 +87,6 @@ services:
       POSTGRES_DB: netbox
     volumes:
       - ./postgres-data:/var/lib/postgresql/data
-    networks:
-      - $ORCH_NET
     restart: unless-stopped
 
   netbox:
@@ -129,17 +101,46 @@ services:
     depends_on:
       - netbox-db
       - netbox-redis
-    networks:
-      - $ORCH_NET
     restart: unless-stopped
 
 networks:
-  $ORCH_NET:
-    external: true
+  orchestrator_net:
+    name: orchestrator_net
 EOF
 
-docker pull netboxcommunity/netbox:latest
-docker compose -f "$NETBOX_DIR/docker-compose.yml" up -d netbox-redis netbox-db netbox
+docker network create orchestrator_net 2>/dev/null || true
+docker compose -f "$NETBOX_DIR/docker-compose.yml" up -d netbox-redis netbox-db
+
+# Wait for NetBox PostgreSQL readiness
+echo "[*] Waiting for NetBox PostgreSQL..."
+MAX_RETRIES=30
+COUNT=0
+until docker exec netbox-db pg_isready -U netbox &>/dev/null; do
+    COUNT=$((COUNT+1))
+    if [ $COUNT -ge $MAX_RETRIES ]; then
+        echo "[!] NetBox PostgreSQL not ready. Exiting."
+        exit 1
+    fi
+    echo "[*] DB not ready, retry $COUNT/$MAX_RETRIES..."
+    sleep 2
+done
+echo "[*] NetBox PostgreSQL ready"
+
+# Wait for NetBox Redis readiness
+echo "[*] Waiting for NetBox Redis..."
+COUNT=0
+until docker exec netbox-redis redis-cli ping &>/dev/null; do
+    COUNT=$((COUNT+1))
+    if [ $COUNT -ge $MAX_RETRIES ]; then
+        echo "[!] NetBox Redis not ready. Exiting."
+        exit 1
+    fi
+    echo "[*] Redis not ready, retry $COUNT/$MAX_RETRIES..."
+    sleep 2
+done
+echo "[*] NetBox Redis ready"
+
+docker compose -f "$NETBOX_DIR/docker-compose.yml" up -d netbox
 phase_summary 1
 
 # -------------------------------
@@ -148,7 +149,8 @@ phase_summary 1
 LIBRENMS_DIR="$BASE_DIR/librenms"
 mkdir -p "$LIBRENMS_DIR"
 
-cat > "$LIBRENMS_DIR/docker-compose.yml" <<EOF
+cat > "$LIBRENMS_DIR/docker-compose.yml" <<'EOF'
+version: '3.9'
 services:
   db:
     image: mariadb:10.11
@@ -160,15 +162,11 @@ services:
       MYSQL_PASSWORD: librenmspass
     volumes:
       - ./db-data:/var/lib/mysql
-    networks:
-      - $ORCH_NET
     restart: unless-stopped
 
   redis:
     image: redis:7
     container_name: librenms-redis
-    networks:
-      - $ORCH_NET
     restart: unless-stopped
 
   librenms:
@@ -180,12 +178,10 @@ services:
       - "8001:80"
     volumes:
       - ./data:/data
-    networks:
-      - $ORCH_NET
     restart: unless-stopped
 
 networks:
-  $ORCH_NET:
+  orchestrator_net:
     external: true
 EOF
 
@@ -199,14 +195,10 @@ DB_PASSWORD=librenmspass
 REDIS_HOST=redis
 EOF
 
-docker pull librenms/librenms:latest
-docker pull mariadb:10.11
-docker pull redis:7
 docker compose -f "$LIBRENMS_DIR/docker-compose.yml" up -d db redis librenms
 
 # Wait for MariaDB readiness
 echo "[*] Waiting for LibreNMS MariaDB..."
-MAX_RETRIES=30
 COUNT=0
 until docker exec librenms-db mysql -uroot -prootpassword -e "SELECT 1;" &>/dev/null; do
     COUNT=$((COUNT+1))
@@ -219,6 +211,19 @@ until docker exec librenms-db mysql -uroot -prootpassword -e "SELECT 1;" &>/dev/
 done
 echo "[*] LibreNMS MariaDB ready"
 
+# Wait for LibreNMS Redis readiness
+COUNT=0
+until docker exec librenms-redis redis-cli ping &>/dev/null; do
+    COUNT=$((COUNT+1))
+    if [ $COUNT -ge $MAX_RETRIES ]; then
+        echo "[!] LibreNMS Redis not ready. Exiting."
+        exit 1
+    fi
+    echo "[*] Redis not ready yet... retry $COUNT/$MAX_RETRIES"
+    sleep 2
+done
+echo "[*] LibreNMS Redis ready"
+
 phase_summary "2 & 3 (LibreNMS)"
 
 # -------------------------------
@@ -226,7 +231,8 @@ phase_summary "2 & 3 (LibreNMS)"
 # -------------------------------
 OXIDIZED_DIR="$BASE_DIR/oxidized"
 mkdir -p "$OXIDIZED_DIR"
-cat > "$OXIDIZED_DIR/docker-compose.yml" <<EOF
+cat > "$OXIDIZED_DIR/docker-compose.yml" <<'EOF'
+version: '3.9'
 services:
   oxidized:
     image: oxidized/oxidized:latest
@@ -236,15 +242,13 @@ services:
     volumes:
       - ./config:/home/oxidized/.config
       - ./logs:/home/oxidized/logs
-    networks:
-      - $ORCH_NET
     restart: unless-stopped
 
 networks:
-  $ORCH_NET:
+  orchestrator_net:
     external: true
 EOF
-docker pull oxidized/oxidized:latest
+
 docker compose -f "$OXIDIZED_DIR/docker-compose.yml" up -d
 phase_summary 4
 
@@ -254,44 +258,39 @@ phase_summary 4
 PASSIVE_DIR="$BASE_DIR/passive"
 mkdir -p "$PASSIVE_DIR"
 
+read -rp "Enter interface for Zeek/Suricata (ex: eth0): " USER_IFACE
+
 # Zeek
 cat > "$PASSIVE_DIR/zeek-compose.yml" <<EOF
+version: '3.9'
 services:
   zeek:
     image: blacktop/zeek:latest
     container_name: zeek
-    network_mode: "host"
-    cap_add:
-      - NET_ADMIN
-      - NET_RAW
-    command: zeek -i $PASSIVE_IF
+    network_mode: host
+    command: zeek -i $USER_IFACE
     restart: unless-stopped
 EOF
 
 # Suricata
 cat > "$PASSIVE_DIR/suricata-compose.yml" <<EOF
+version: '3.9'
 services:
   suricata:
     image: jasonish/suricata:latest
     container_name: suricata
-    network_mode: "host"
-    cap_add:
-      - NET_ADMIN
-      - NET_RAW
-      - SYS_NICE
-    volumes:
-      - ./rules:/var/lib/suricata/rules
-    command: suricata -i $PASSIVE_IF -c /etc/suricata/suricata.yaml
+    network_mode: host
     restart: unless-stopped
 EOF
 
 # Ntopng
 cat > "$PASSIVE_DIR/ntopng-compose.yml" <<EOF
+version: '3.9'
 services:
   ntopng:
     image: ntop/ntopng:latest
     container_name: ntopng
-    network_mode: "host"
+    network_mode: host
     restart: unless-stopped
 EOF
 
@@ -318,7 +317,7 @@ chmod +x "$COMPUTE_DIR/discovery.sh"
 phase_summary 6
 
 # -------------------------------
-# Phase 7: Ingestion / Zeek → NetBox placeholder
+# Phase 7: Ingestion / Dry Run
 # -------------------------------
 INGEST_DIR="$BASE_DIR/ingestion"
 mkdir -p "$INGEST_DIR"
@@ -326,7 +325,6 @@ cat > "$INGEST_DIR/ingest.sh" <<'EOF'
 #!/bin/bash
 # Placeholder: SNMP, SSH, API ingestion
 echo "[*] Placeholder: Dry-run discovery, validate devices before NetBox write"
-# Placeholder: Zeek -> NetBox ingestion logic goes here
 EOF
 chmod +x "$INGEST_DIR/ingest.sh"
 phase_summary 7
