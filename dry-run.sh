@@ -23,8 +23,8 @@ auto_elevate "$@"
 # -------------------------------
 # Prompt for Base Directory
 # -------------------------------
-read -rp "Enter base directory for deployment [/opt/netbox-discovery]: " USER_BASE_DIR
-BASE_DIR="${USER_BASE_DIR:-/opt/netbox-discovery}"
+read -rp "Enter base directory for deployment [/opt/netbox-docker]: " USER_BASE_DIR
+BASE_DIR="${USER_BASE_DIR:-/opt/netbox-docker}"
 echo "[*] Using base directory: $BASE_DIR"
 mkdir -p "$BASE_DIR"
 
