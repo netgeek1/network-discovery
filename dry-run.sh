@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================
-# Network Mapping Orchestrator — Version 2.2
+# Network Mapping Orchestrator — Version 2.3
 # Fully Dockerized | Auto-Elevating | 8 Phases
 # NetBox uses PostgreSQL | LibreNMS uses MariaDB
 # Includes Ingestion, Passive Traffic, Compute Discovery
@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.2"
+SCRIPT_VERSION="2.3"
 echo "[*] Network Mapping Orchestrator — Version $SCRIPT_VERSION"
 
 # -------------------------------
@@ -175,7 +175,7 @@ services:
     env_file:
       - librenms.env
     ports:
-      - "8001:80"
+      - "8001:8000"
     volumes:
       - ./data:/data
     restart: unless-stopped
