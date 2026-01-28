@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================
-# Network Mapping Orchestrator — Version 2.1.4
+# Network Mapping Orchestrator — Version 2.1.5
 # Fully Dockerized | Auto-Elevating | 8 Phases
 # NetBox uses PostgreSQL | LibreNMS uses MariaDB
 # Includes Ingestion, Passive Traffic, Compute Discovery
@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.1.4"
+SCRIPT_VERSION="2.1.5"
 echo "[*] Network Mapping Orchestrator — Version $SCRIPT_VERSION"
 
 # -------------------------------
@@ -225,63 +225,66 @@ echo "[*] LibreNMS Redis ready"
 phase_summary "2 & 3 (LibreNMS)"
 
 # -------------------------------
-# Phase 4: Oxidized (FINAL FIX)
+# Phase 4: Oxidized (NetBox-backed)
 # -------------------------------
 OXIDIZED_DIR="$BASE_DIR/oxidized"
-mkdir -p "$OXIDIZED_DIR/config/oxidized"
-mkdir -p "$OXIDIZED_DIR/configs"
-mkdir -p "$OXIDIZED_DIR/logs"
+mkdir -p \
+  "$OXIDIZED_DIR/config/oxidized" \
+  "$OXIDIZED_DIR/logs" \
+  "$OXIDIZED_DIR/git"
 
-# ---- Correct config filename ----
-cat > "$OXIDIZED_DIR/config/oxidized/config.yml" <<'EOF'
+# Oxidized container runs as UID 1000
+chown -R 1000:1000 "$OXIDIZED_DIR"
+chmod -R 755 "$OXIDIZED_DIR"
+
+# ---- NetBox API token ----
+read -rp "Enter NetBox API token for Oxidized: " NETBOX_API_TOKEN
+
+# ---- Oxidized config ----
+cat > "$OXIDIZED_DIR/config/oxidized/config.yml" <<EOF
 ---
 username: admin
-password: admin
-model: ios
-
 interval: 3600
-threads: 5
 timeout: 20
 retries: 1
-
+prompt: !ruby/regexp /^([\\w.@-]+[#>]\\s?)$/
 rest: 0.0.0.0:8888
 
 source:
-  default: yaml
-  yaml:
-    file: /home/oxidized/.config/oxidized/nodes.yml
+  default: netbox
+  netbox:
+    url: http://netbox:8080
+    token: ${NETBOX_API_TOKEN}
+    ssl_verify: false
+    timeout: 20
 
 output:
-  file:
-    directory: /home/oxidized/configs
+  default: git
+  git:
+    user: Oxidized
+    email: oxidized@localhost
+    repo: /home/oxidized/git
 
-input:
-  default: ssh
-
-log: /home/oxidized/logs/oxidized.log
+model_map:
+  ios: ios
+  nxos: nxos
+  junos: junos
+  eos: eos
 EOF
 
-# ---- Required node file ----
-cat > "$OXIDIZED_DIR/config/oxidized/nodes.yml" <<'EOF'
----
-# example:
-# router1:
-#   host: 192.0.2.1
-#   model: ios
-EOF
-
-# ---- docker-compose (NO user override) ----
+# ---- Docker Compose ----
 cat > "$OXIDIZED_DIR/docker-compose.yml" <<'EOF'
 services:
   oxidized:
     image: oxidized/oxidized:latest
     container_name: oxidized
+    user: "1000:1000"
     ports:
       - "8888:8888"
     volumes:
       - ./config:/home/oxidized/.config
-      - ./configs:/home/oxidized/configs
       - ./logs:/home/oxidized/logs
+      - ./git:/home/oxidized/git
     restart: unless-stopped
     networks:
       - orchestrator_net
@@ -291,17 +294,18 @@ networks:
     external: true
 EOF
 
-# ---- reset container cleanly ----
-docker compose -f "$OXIDIZED_DIR/docker-compose.yml" down -v || true
 docker pull oxidized/oxidized:latest
 docker compose -f "$OXIDIZED_DIR/docker-compose.yml" up -d
 
-# ---- fix ownership AFTER start ----
-sleep 5
-docker exec oxidized chown -R oxidized:oxidized \
-  /home/oxidized/.config \
-  /home/oxidized/configs \
-  /home/oxidized/logs || true
+# ---- Wait for Oxidized REST API ----
+echo "[*] Waiting for Oxidized REST API..."
+for i in {1..30}; do
+  if curl -fs http://localhost:8888/nodes >/dev/null 2>&1; then
+    echo "[✓] Oxidized API online"
+    break
+  fi
+  sleep 2
+done
 
 phase_summary 4
 
