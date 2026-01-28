@@ -3,6 +3,58 @@ set -euo pipefail
 
 # This is a basic working Oxidized docker script
 
+# ------------------------------------------------------------
+# Root handling
+# ------------------------------------------------------------
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "[INFO] Elevation required — re-running with sudo..."
+        sudo -E bash "$0" "$@"
+        exit $?
+    fi
+}
+
+# ------------------------------------------------------------
+# Docker install
+# ------------------------------------------------------------
+install_docker() {
+  if command -v docker >/dev/null 2>&1; then
+    log "Docker already installed."
+    return
+  fi
+
+  log "Installing Docker Engine..."
+
+  apt-get update
+  apt-get install -y ca-certificates curl gnupg lsb-release openssl git
+
+  mkdir -p /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  chmod a+r /etc/apt/keyrings/docker.gpg
+
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+    > /etc/apt/sources.list.d/docker.list
+
+  apt-get update
+  apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+
+  systemctl enable docker
+  systemctl start docker
+
+  log "Docker installed."
+}
+
+ensure_docker_group() {
+  getent group docker >/dev/null || groupadd docker
+  if ! id "$REAL_USER" | grep -q docker; then
+    log "Adding user '$REAL_USER' to docker group"
+    usermod -aG docker "$REAL_USER"
+    warn "You may need to log out/in for group changes to apply."
+  fi
+}
+
 # ============================
 #   CONFIGURATION
 # ============================
