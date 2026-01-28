@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================
-# Network Mapping Orchestrator — Version 2.1.7
+# Network Mapping Orchestrator — Version 2.2 
 # Fully Dockerized | Auto-Elevating | 8 Phases
 # NetBox uses PostgreSQL | LibreNMS uses MariaDB
 # Includes Ingestion, Passive Traffic, Compute Discovery
@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.1.7"
+SCRIPT_VERSION="2.2"
 echo "[*] Network Mapping Orchestrator — Version $SCRIPT_VERSION"
 
 # -------------------------------
@@ -117,12 +117,6 @@ docker pull redis:7
 docker compose -f "$LIBRENMS_DIR/docker-compose.yml" up -d db redis librenms
 phase_summary "2 & 3 (LibreNMS)"
 
-# Wait for LibreNMS DB and Redis
-echo "[*] Waiting for LibreNMS DB and Redis..."
-until docker exec librenms-db mysqladmin ping -h "localhost" --silent; do sleep 2; done
-until docker exec librenms-redis redis-cli ping | grep -q PONG; do sleep 2; done
-echo "[*] LibreNMS DB and Redis are ready"
-
 # -------------------------------
 # Phase 1: NetBox Skeleton + PostgreSQL + Redis
 # -------------------------------
@@ -194,45 +188,21 @@ docker compose -f "$NETBOX_DIR/docker-compose.yml" up -d netbox-redis netbox-db 
 phase_summary 1
 
 # -------------------------------
-# Phase 4: Oxidized (Patched v2.1.1 — NetBox API auto)
+# Phase 4: Oxidized + Git (patched v2.2)
 # -------------------------------
 OXIDIZED_DIR="$BASE_DIR/oxidized"
 mkdir -p "$OXIDIZED_DIR/config/oxidized" "$OXIDIZED_DIR/logs" "$OXIDIZED_DIR/git"
+
+# Pre-create files to prevent crashes
+touch "$OXIDIZED_DIR/config/oxidized/router.db" "$OXIDIZED_DIR/config/oxidized/nodes.yaml"
 chown -R 1000:1000 "$OXIDIZED_DIR"
 chmod -R 755 "$OXIDIZED_DIR"
 
-# Generate a random token for Oxidized NetBox API
-NETBOX_API_TOKEN=$(openssl rand -hex 32)
-echo "[*] Generated NetBox API token for Oxidized: $NETBOX_API_TOKEN"
-
-cat > "$OXIDIZED_DIR/docker-compose.yml" <<EOF
-services:
-  oxidized:
-    image: oxidized/oxidized:latest
-    container_name: oxidized
-    ports:
-      - "8888:8888"
-    volumes:
-      - ./config/oxidized:/home/oxidized/.config/oxidized
-      - ./logs:/home/oxidized/logs
-      - ./git:/home/oxidized/git
-    environment:
-      - USER=oxidized
-    restart: unless-stopped
-    networks:
-      - orchestrator_net
-
-networks:
-  orchestrator_net:
-    external: true
-EOF
-
-# Minimal Oxidized config using auto-generated NetBox token
+# Minimal config
 cat > "$OXIDIZED_DIR/config/oxidized/config" <<EOF
 ---
 username: admin
 password: admin
-model: junos
 interval: 3600
 use_syslog: false
 debug: false
@@ -247,12 +217,30 @@ output:
     email: oxidized@example.com
     repo: "/home/oxidized/git"
 source:
-  netbox:
-    url: "http://netbox:8000"
-    token: "$NETBOX_API_TOKEN"
-model_map:
-  cisco: ios
-  juniper: junos
+  yaml:
+    file: "/home/oxidized/.config/oxidized/nodes.yaml"
+EOF
+
+# Docker Compose
+cat > "$OXIDIZED_DIR/docker-compose.yml" <<'EOF'
+services:
+  oxidized:
+    image: oxidized/oxidized:latest
+    container_name: oxidized
+    user: "1000:1000"
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./config:/home/oxidized/.config/oxidized
+      - ./logs:/home/oxidized/logs
+      - ./git:/home/oxidized/git
+    restart: unless-stopped
+    networks:
+      - orchestrator_net
+
+networks:
+  orchestrator_net:
+    external: true
 EOF
 
 docker pull oxidized/oxidized:latest
@@ -345,8 +333,8 @@ echo "[*] Phase 8: Validations / Completeness checks"
 echo "[*] Script finished all 8 phases — network skeleton and passive/compute ready"
 phase_summary 8
 
-echo "[*] Orchestrator v2.1 bootstrap complete!"
+echo "[*] Orchestrator v2.2 bootstrap complete!"
 echo "[*] Base directory: $BASE_DIR"
 echo "[*] LibreNMS should now be reachable on http://localhost:8001"
 echo "[*] NetBox reachable on http://localhost:8000"
-echo "[*] Oxidized web UI reachable on http://localhost:8888 (NetBox API token auto-wired)"
+echo "[*] Oxidized web GUI on http://localhost:8888"
