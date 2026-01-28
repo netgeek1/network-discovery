@@ -189,8 +189,6 @@ EOF
 # ============================
 echo "[INFO] Writing docker-compose.yml..."
 cat > "$OXI_COMPOSE" <<EOF
-version: "3.8"
-
 services:
   oxidized:
     image: oxidized/oxidized:latest
