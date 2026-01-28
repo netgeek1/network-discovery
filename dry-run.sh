@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================
-# Network Mapping Orchestrator — Version 2.1.3
+# Network Mapping Orchestrator — Version 2.1.4
 # Fully Dockerized | Auto-Elevating | 8 Phases
 # NetBox uses PostgreSQL | LibreNMS uses MariaDB
 # Includes Ingestion, Passive Traffic, Compute Discovery
@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.1.3"
+SCRIPT_VERSION="2.1.4"
 echo "[*] Network Mapping Orchestrator — Version $SCRIPT_VERSION"
 
 # -------------------------------
@@ -225,14 +225,14 @@ echo "[*] LibreNMS Redis ready"
 phase_summary "2 & 3 (LibreNMS)"
 
 # -------------------------------
-# Phase 4: Oxidized (FIXED v2)
+# Phase 4: Oxidized (FINAL FIX)
 # -------------------------------
 OXIDIZED_DIR="$BASE_DIR/oxidized"
 mkdir -p "$OXIDIZED_DIR/config/oxidized"
 mkdir -p "$OXIDIZED_DIR/configs"
 mkdir -p "$OXIDIZED_DIR/logs"
 
-# ---- Correct filename: config.yml ----
+# ---- Correct config filename ----
 cat > "$OXIDIZED_DIR/config/oxidized/config.yml" <<'EOF'
 ---
 username: admin
@@ -240,8 +240,6 @@ password: admin
 model: ios
 
 interval: 3600
-use_syslog: false
-debug: false
 threads: 5
 timeout: 20
 retries: 1
@@ -259,28 +257,25 @@ output:
 
 input:
   default: ssh
-  ssh:
-    secure: false
 
 log: /home/oxidized/logs/oxidized.log
 EOF
 
-# ---- REQUIRED even if empty ----
+# ---- Required node file ----
 cat > "$OXIDIZED_DIR/config/oxidized/nodes.yml" <<'EOF'
 ---
-# devices go here
+# example:
+# router1:
+#   host: 192.0.2.1
+#   model: ios
 EOF
 
-# ---- Pre-create log file with correct ownership ----
-touch "$OXIDIZED_DIR/logs/oxidized.log"
-
-# ---- docker-compose ----
+# ---- docker-compose (NO user override) ----
 cat > "$OXIDIZED_DIR/docker-compose.yml" <<'EOF'
 services:
   oxidized:
     image: oxidized/oxidized:latest
     container_name: oxidized
-    user: "1000:1000"
     ports:
       - "8888:8888"
     volumes:
@@ -296,13 +291,17 @@ networks:
     external: true
 EOF
 
-# ---- FIX permissions HARD ----
-chown -R 1000:1000 "$OXIDIZED_DIR"
-chmod -R 775 "$OXIDIZED_DIR"
-
+# ---- reset container cleanly ----
+docker compose -f "$OXIDIZED_DIR/docker-compose.yml" down -v || true
 docker pull oxidized/oxidized:latest
-docker compose -f "$OXIDIZED_DIR/docker-compose.yml" down || true
 docker compose -f "$OXIDIZED_DIR/docker-compose.yml" up -d
+
+# ---- fix ownership AFTER start ----
+sleep 5
+docker exec oxidized chown -R oxidized:oxidized \
+  /home/oxidized/.config \
+  /home/oxidized/configs \
+  /home/oxidized/logs || true
 
 phase_summary 4
 
