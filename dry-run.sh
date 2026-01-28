@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================
-# Network Mapping Orchestrator — Version 2.2 
+# Network Mapping Orchestrator — Version 2.2.1
 # Fully Dockerized | Auto-Elevating | 8 Phases
 # NetBox uses PostgreSQL | LibreNMS uses MariaDB
 # Includes Ingestion, Passive Traffic, Compute Discovery
@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.2"
+SCRIPT_VERSION="2.2.1"
 echo "[*] Network Mapping Orchestrator — Version $SCRIPT_VERSION"
 
 # -------------------------------
@@ -188,40 +188,24 @@ docker compose -f "$NETBOX_DIR/docker-compose.yml" up -d netbox-redis netbox-db 
 phase_summary 1
 
 # -------------------------------
-# Phase 4: Oxidized + Git (patched v2.2)
+# Phase 4: Oxidized + Git (v2.2, fixed)
 # -------------------------------
 OXIDIZED_DIR="$BASE_DIR/oxidized"
+mkdir -p "$OXIDIZED_DIR"
+
+# Create directories for Oxidized
 mkdir -p "$OXIDIZED_DIR/config/oxidized" "$OXIDIZED_DIR/logs" "$OXIDIZED_DIR/git"
 
-# Pre-create files to prevent crashes
-touch "$OXIDIZED_DIR/config/oxidized/router.db" "$OXIDIZED_DIR/config/oxidized/nodes.yaml"
+# Ensure minimal required files exist to prevent crash
+for file in router.db nodes.yaml; do
+    touch "$OXIDIZED_DIR/config/oxidized/$file"
+done
+
+# Set ownership to Oxidized user (1000:1000) for container
 chown -R 1000:1000 "$OXIDIZED_DIR"
 chmod -R 755 "$OXIDIZED_DIR"
 
-# Minimal config
-cat > "$OXIDIZED_DIR/config/oxidized/config" <<EOF
----
-username: admin
-password: admin
-interval: 3600
-use_syslog: false
-debug: false
-threads: 30
-timeout: 20
-retries: 3
-prompt: !ruby/regexp /^([\w.@-]+[#>]\s?)\$/
-rest: 8888
-output:
-  git:
-    user: Oxidized
-    email: oxidized@example.com
-    repo: "/home/oxidized/git"
-source:
-  yaml:
-    file: "/home/oxidized/.config/oxidized/nodes.yaml"
-EOF
-
-# Docker Compose
+# docker-compose.yml
 cat > "$OXIDIZED_DIR/docker-compose.yml" <<'EOF'
 services:
   oxidized:
@@ -231,9 +215,9 @@ services:
     ports:
       - "8888:8888"
     volumes:
-      - ./config:/home/oxidized/.config/oxidized
-      - ./logs:/home/oxidized/logs
-      - ./git:/home/oxidized/git
+      - ./config:/home/oxidized/.config/oxidized:rw
+      - ./logs:/home/oxidized/logs:rw
+      - ./git:/home/oxidized/git:rw
     restart: unless-stopped
     networks:
       - orchestrator_net
@@ -243,6 +227,7 @@ networks:
     external: true
 EOF
 
+# Pull and run Oxidized
 docker pull oxidized/oxidized:latest
 docker compose -f "$OXIDIZED_DIR/docker-compose.yml" up -d
 phase_summary 4
