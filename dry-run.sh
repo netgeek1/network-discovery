@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================
-# Network Mapping Orchestrator — Version 2.1.1
+# Network Mapping Orchestrator — Version 2.1.3
 # Fully Dockerized | Auto-Elevating | 8 Phases
 # NetBox uses PostgreSQL | LibreNMS uses MariaDB
 # Includes Ingestion, Passive Traffic, Compute Discovery
@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.1.1"
+SCRIPT_VERSION="2.1.3"
 echo "[*] Network Mapping Orchestrator — Version $SCRIPT_VERSION"
 
 # -------------------------------
@@ -225,59 +225,62 @@ echo "[*] LibreNMS Redis ready"
 phase_summary "2 & 3 (LibreNMS)"
 
 # -------------------------------
-# Phase 4: Oxidized (Hardened)
+# Phase 4: Oxidized (FIXED v2)
 # -------------------------------
 OXIDIZED_DIR="$BASE_DIR/oxidized"
-mkdir -p "$OXIDIZED_DIR"/{config/oxidized,configs,logs}
+mkdir -p "$OXIDIZED_DIR/config/oxidized"
+mkdir -p "$OXIDIZED_DIR/configs"
+mkdir -p "$OXIDIZED_DIR/logs"
 
-# Oxidized config (pre-seeded to avoid crash)
-cat > "$OXIDIZED_DIR/config/oxidized/config" <<'EOF'
+# ---- Correct filename: config.yml ----
+cat > "$OXIDIZED_DIR/config/oxidized/config.yml" <<'EOF'
 ---
 username: admin
 password: admin
-model: generic
+model: ios
+
 interval: 3600
 use_syslog: false
 debug: false
-threads: 30
+threads: 5
 timeout: 20
-retries: 3
+retries: 1
 
 rest: 0.0.0.0:8888
 
-vars:
-  enable: true
-
-groups: {}
-
-models:
-  generic:
-    username: admin
-    password: admin
-
-input:
-  default: ssh, telnet
+source:
+  default: yaml
+  yaml:
+    file: /home/oxidized/.config/oxidized/nodes.yml
 
 output:
-  default: file
   file:
     directory: /home/oxidized/configs
 
-source:
-  default: sqlite
-  sqlite:
-    file: /home/oxidized/.config/oxidized/router.db
+input:
+  default: ssh
+  ssh:
+    secure: false
+
+log: /home/oxidized/logs/oxidized.log
 EOF
 
-# Permissions (official image runs as UID 1000)
-chown -R 1000:1000 "$OXIDIZED_DIR"
+# ---- REQUIRED even if empty ----
+cat > "$OXIDIZED_DIR/config/oxidized/nodes.yml" <<'EOF'
+---
+# devices go here
+EOF
 
-# Docker Compose
+# ---- Pre-create log file with correct ownership ----
+touch "$OXIDIZED_DIR/logs/oxidized.log"
+
+# ---- docker-compose ----
 cat > "$OXIDIZED_DIR/docker-compose.yml" <<'EOF'
 services:
   oxidized:
     image: oxidized/oxidized:latest
     container_name: oxidized
+    user: "1000:1000"
     ports:
       - "8888:8888"
     volumes:
@@ -293,8 +296,14 @@ networks:
     external: true
 EOF
 
+# ---- FIX permissions HARD ----
+chown -R 1000:1000 "$OXIDIZED_DIR"
+chmod -R 775 "$OXIDIZED_DIR"
+
 docker pull oxidized/oxidized:latest
+docker compose -f "$OXIDIZED_DIR/docker-compose.yml" down || true
 docker compose -f "$OXIDIZED_DIR/docker-compose.yml" up -d
+
 phase_summary 4
 
 # -------------------------------
