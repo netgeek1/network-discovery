@@ -1,41 +1,30 @@
-#!/bin/bash
-# ====================================================
-# Network Mapping Orchestrator — Version 2.2.1
-# Fully Dockerized | Auto-Elevating | 8 Phases
-# NetBox uses PostgreSQL | LibreNMS uses MariaDB
-# Includes Ingestion, Passive Traffic, Compute Discovery
-# ====================================================
-
+#!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_VERSION="2.2.1"
+# ============================================================
+#  Network Mapping Orchestrator — Version 2.4
+#  Base: /opt/orchestrator-v2.4
+#  NetBox (8080) | LibreNMS (8000) | Oxidized (8888)
+#  Passive Traffic | Compute Discovery | Ingestion Pipeline
+# ============================================================
+
+SCRIPT_VERSION="2.4"
+
+echo
+echo "============================================================"
 echo "[*] Network Mapping Orchestrator — Version $SCRIPT_VERSION"
+echo "============================================================"
+echo
 
-# -------------------------------
-# Auto-elevate
-# -------------------------------
-if [[ $EUID -ne 0 ]]; then
-    echo "[*] Elevation required. Re-running as root..."
-    exec sudo bash "$0" "$@"
-    exit 0
-fi
+# ------------------------------------------------------------
+#  User + Logging Helpers
+# ------------------------------------------------------------
+REAL_USER="${SUDO_USER:-${LOGNAME:-$(whoami)}}"
 
-# -------------------------------
-# Base Directory Prompt
-# -------------------------------
-read -rp "Enter base directory for deployment [/opt/netbox-docker]: " USER_BASE_DIR
-BASE_DIR="${USER_BASE_DIR:-/opt/netbox-docker}"
-mkdir -p "$BASE_DIR"
-echo "[*] Using base directory: $BASE_DIR"
+log()   { printf '[INFO] %s\n' "$*"; }
+warn()  { printf '[WARN] %s\n' "$*" >&2; }
+error() { printf '[ERROR] %s\n' "$*" >&2; }
 
-# -------------------------------
-# Docker network
-# -------------------------------
-docker network inspect orchestrator_net >/dev/null 2>&1 || docker network create orchestrator_net
-
-# -------------------------------
-# Utility function: phase summary
-# -------------------------------
 phase_summary() {
   echo
   echo "===================================================="
@@ -44,96 +33,152 @@ phase_summary() {
   echo
 }
 
-# -------------------------------
-# Phase 0: Define Tags & Config
-# -------------------------------
-PHASE0_DIR="$BASE_DIR/phase0"
+# ------------------------------------------------------------
+#  Root handling
+# ------------------------------------------------------------
+require_root() {
+  if [[ $EUID -ne 0 ]]; then
+    echo "[INFO] Elevation required — re-running with sudo..."
+    exec sudo -E bash "$0" "$@"
+  fi
+}
+
+require_root
+
+# ------------------------------------------------------------
+#  Docker install + group
+# ------------------------------------------------------------
+install_docker() {
+  if command -v docker >/dev/null 2>&1; then
+    log "Docker already installed."
+    return
+  fi
+
+  log "Installing Docker Engine..."
+
+  if ! command -v apt-get >/dev/null 2>&1; then
+    error "This installer currently expects a Debian/Ubuntu base (apt-get)."
+    exit 1
+  fi
+
+  apt-get update
+  apt-get install -y ca-certificates curl gnupg lsb-release openssl git
+
+  mkdir -p /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  chmod a+r /etc/apt/keyrings/docker.gpg
+
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+    > /etc/apt/sources.list.d/docker.list
+
+  apt-get update
+  apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+
+  systemctl enable docker
+  systemctl start docker
+
+  log "Docker installed."
+}
+
+ensure_docker_group() {
+  getent group docker >/dev/null || groupadd docker
+  if ! id "$REAL_USER" | grep -q docker; then
+    log "Adding user '$REAL_USER' to docker group"
+    usermod -aG docker "$REAL_USER"
+    warn "You may need to log out/in for group changes to apply."
+  fi
+}
+
+install_docker
+ensure_docker_group
+
+# ------------------------------------------------------------
+#  Determine compose command
+# ------------------------------------------------------------
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE_CMD="docker compose"
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE_CMD="docker-compose"
+else
+  apt-get install -y docker-compose-plugin || true
+  if docker compose version >/dev/null 2>&1; then
+    COMPOSE_CMD="docker compose"
+  elif command -v docker-compose >/dev/null 2>&1; then
+    COMPOSE_CMD="docker-compose"
+  else
+    error "Docker Compose not available"
+    exit 1
+  fi
+fi
+
+# ------------------------------------------------------------
+#  Interactive configuration
+# ------------------------------------------------------------
+prompt() {
+  local message="$1"
+  local default="$2"
+  read -rp "$message [$default]: " input
+  echo "${input:-$default}"
+}
+
+BASE_ROOT="/opt/orchestrator"
+BASE_ROOT=$(prompt "Enter base directory for orchestrator" "$BASE_ROOT")
+
+TZ_VALUE=$(prompt "Enter your timezone" "America/New_York")
+
+echo "Generating random MySQL password for LibreNMS..."
+LIBRENMS_DB_PASSWORD=$(openssl rand -base64 24 | tr -d '\n')
+
+echo
+echo "SMTP configuration for LibreNMS:"
+SMTP_HOST=$(prompt "SMTP host" "smtp.gmail.com")
+SMTP_PORT=$(prompt "SMTP port" "587")
+SMTP_USER=$(prompt "SMTP username" "user@example.com")
+SMTP_PASS=$(prompt "SMTP password" "changeme")
+SMTP_FROM=$(prompt "SMTP from address" "$SMTP_USER")
+
+mkdir -p "$BASE_ROOT"
+
+NETBOX_DIR="$BASE_ROOT/netbox"
+LIBRENMS_DIR="$BASE_ROOT/librenms"
+OXIDIZED_DIR="$BASE_ROOT/oxidized"
+PASSIVE_DIR="$BASE_ROOT/passive"
+COMPUTE_DIR="$BASE_ROOT/compute"
+INGEST_DIR="$BASE_ROOT/ingestion"
+
+mkdir -p "$NETBOX_DIR" "$LIBRENMS_DIR" "$OXIDIZED_DIR" "$PASSIVE_DIR" "$COMPUTE_DIR" "$INGEST_DIR"
+
+# ------------------------------------------------------------
+#  Phase 0: Tags / Network
+# ------------------------------------------------------------
+PHASE0_DIR="$BASE_ROOT/phase0"
 mkdir -p "$PHASE0_DIR"
+
 cat > "$PHASE0_DIR/tags.env" <<'EOF'
 NETBOX_TAGS="observed-only,enriched,validated,manual,no-auto-update"
 EOF
+
+docker network create orchestrator_net 2>/dev/null || true
+
 phase_summary 0
 
-# -------------------------------
-# Phase 2 & 3: LibreNMS
-# -------------------------------
-LIBRENMS_DIR="$BASE_DIR/librenms"
-mkdir -p "$LIBRENMS_DIR"
+# ------------------------------------------------------------
+#  Phase 1: NetBox (8080)
+# ------------------------------------------------------------
+NETBOX_ENV="$NETBOX_DIR/netbox.env"
 
-cat > "$LIBRENMS_DIR/docker-compose.yml" <<'EOF'
-services:
-  db:
-    image: mariadb:10.11
-    container_name: librenms-db
-    environment:
-      MYSQL_ROOT_PASSWORD: rootpassword
-      MYSQL_DATABASE: librenms
-      MYSQL_USER: librenms
-      MYSQL_PASSWORD: librenmspass
-    volumes:
-      - ./db-data:/var/lib/mysql
-    restart: unless-stopped
-    networks:
-      - orchestrator_net
+NETBOX_SECRET=$(openssl rand -base64 64 | tr -d '\n')
 
-  redis:
-    image: redis:7
-    container_name: librenms-redis
-    restart: unless-stopped
-    networks:
-      - orchestrator_net
-
-  librenms:
-    image: librenms/librenms:latest
-    container_name: librenms
-    env_file:
-      - librenms.env
-    ports:
-      - "8001:8000"
-    volumes:
-      - ./data:/data
-    restart: unless-stopped
-    networks:
-      - orchestrator_net
-
-networks:
-  orchestrator_net:
-    external: true
-EOF
-
-cat > "$LIBRENMS_DIR/librenms.env" <<EOF
-APP_KEY=$(openssl rand -base64 32)
-BASE_URL=http://localhost:8001
-DB_HOST=db
-DB_NAME=librenms
-DB_USER=librenms
-DB_PASSWORD=librenmspass
-REDIS_HOST=redis
-EOF
-
-docker pull librenms/librenms:latest
-docker pull mariadb:10.11
-docker pull redis:7
-docker compose -f "$LIBRENMS_DIR/docker-compose.yml" up -d db redis librenms
-phase_summary "2 & 3 (LibreNMS)"
-
-# -------------------------------
-# Phase 1: NetBox Skeleton + PostgreSQL + Redis
-# -------------------------------
-NETBOX_DIR="$BASE_DIR/netbox"
-mkdir -p "$NETBOX_DIR"
-
-NETBOX_SECRET=$(openssl rand -base64 64)
-NETBOX_SECRET_ESCAPED="\"${NETBOX_SECRET}\""
-
-cat > "$NETBOX_DIR/netbox.env" <<EOF
+cat > "$NETBOX_ENV" <<EOF
 ALLOWED_HOSTS=*
 DB_NAME=netbox
 DB_USER=netbox
 DB_PASSWORD=netbox123
 DB_HOST=netbox-db
 DB_PORT=5432
-SECRET_KEY=${NETBOX_SECRET_ESCAPED}
+SECRET_KEY=${NETBOX_SECRET}
 REDIS_HOST=netbox-redis
 REDIS_PORT=6379
 EOF
@@ -143,8 +188,6 @@ services:
   netbox-redis:
     image: redis:7
     container_name: netbox-redis
-    ports:
-      - "6379:6379"
     restart: unless-stopped
     networks:
       - orchestrator_net
@@ -168,7 +211,10 @@ services:
     env_file:
       - netbox.env
     ports:
-      - "8000:8080"
+      - "8080:8080"
+    environment:
+      - "SUPERUSER_EMAIL=admin@example.com"
+      - "SUPERUSER_PASSWORD=admin"
     volumes:
       - ./netbox-data:/opt/netbox/netbox/media
     depends_on:
@@ -183,42 +229,247 @@ networks:
     external: true
 EOF
 
-docker pull netboxcommunity/netbox:latest
-docker compose -f "$NETBOX_DIR/docker-compose.yml" up -d netbox-redis netbox-db netbox
-phase_summary 1
+$COMPOSE_CMD -f "$NETBOX_DIR/docker-compose.yml" pull
+$COMPOSE_CMD -f "$NETBOX_DIR/docker-compose.yml" up -d netbox-redis netbox-db
 
-# -------------------------------
-# Phase 4: Oxidized + Git (v2.2, fixed)
-# -------------------------------
-OXIDIZED_DIR="$BASE_DIR/oxidized"
-mkdir -p "$OXIDIZED_DIR"
+echo "[*] Waiting for NetBox PostgreSQL..."
+MAX_RETRIES=30
+COUNT=0
+until docker exec netbox-db pg_isready -U netbox &>/dev/null; do
+  COUNT=$((COUNT+1))
+  if [ $COUNT -ge $MAX_RETRIES ]; then
+    error "NetBox PostgreSQL not ready. Exiting."
+    exit 1
+  fi
+  echo "[*] DB not ready, retry $COUNT/$MAX_RETRIES..."
+  sleep 2
+done
+echo "[*] NetBox PostgreSQL ready"
 
-# Create directories for Oxidized
-mkdir -p "$OXIDIZED_DIR/config/oxidized" "$OXIDIZED_DIR/logs" "$OXIDIZED_DIR/git"
+echo "[*] Waiting for NetBox Redis..."
+COUNT=0
+until docker exec netbox-redis redis-cli ping &>/dev/null; do
+  COUNT=$((COUNT+1))
+  if [ $COUNT -ge $MAX_RETRIES ]; then
+    error "NetBox Redis not ready. Exiting."
+    exit 1
+  fi
+  echo "[*] Redis not ready, retry $COUNT/$MAX_RETRIES..."
+  sleep 2
+done
+echo "[*] NetBox Redis ready"
 
-# Ensure minimal required files exist to prevent crash
-for file in router.db nodes.yaml; do
-    touch "$OXIDIZED_DIR/config/oxidized/$file"
+$COMPOSE_CMD -f "$NETBOX_DIR/docker-compose.yml" up -d netbox
+
+echo "[*] Waiting for NetBox web UI on http://localhost:8080..."
+for i in {1..60}; do
+  if curl -fs http://localhost:8080 >/dev/null 2>&1; then
+    echo "[*] NetBox is ready at: http://localhost:8080"
+    break
+  fi
+  sleep 2
 done
 
-# Set ownership to Oxidized user (1000:1000) for container
-chown -R 1000:1000 "$OXIDIZED_DIR"
-chmod -R 755 "$OXIDIZED_DIR"
+phase_summary 1
 
-# docker-compose.yml
-cat > "$OXIDIZED_DIR/docker-compose.yml" <<'EOF'
+# ------------------------------------------------------------
+#  Phase 2 & 3: LibreNMS (full multi-container, 8000)
+# ------------------------------------------------------------
+LIBRENMS_ENV="$LIBRENMS_DIR/librenms.env"
+LIBRENMS_DOTENV="$LIBRENMS_DIR/.env"
+MSMTPD_ENV="$LIBRENMS_DIR/msmtpd.env"
+LIBRENMS_COMPOSE="$LIBRENMS_DIR/docker-compose.yml"
+
+cat > "$LIBRENMS_DOTENV" <<EOF
+TZ=${TZ_VALUE}
+PUID=1000
+PGID=1000
+
+MYSQL_DATABASE=librenms
+MYSQL_USER=librenms
+MYSQL_PASSWORD=${LIBRENMS_DB_PASSWORD}
+EOF
+
+cat > "$LIBRENMS_ENV" <<EOF
+MEMORY_LIMIT=256M
+MAX_INPUT_VARS=1000
+UPLOAD_MAX_SIZE=16M
+OPCACHE_MEM_SIZE=128
+REAL_IP_FROM=0.0.0.0/32
+REAL_IP_HEADER=X-Forwarded-For
+LOG_IP_VAR=remote_addr
+
+CACHE_DRIVER=redis
+SESSION_DRIVER=redis
+REDIS_HOST=redis
+
+LIBRENMS_SNMP_COMMUNITY=librenmsdocker
+
+LIBRENMS_WEATHERMAP=false
+LIBRENMS_WEATHERMAP_SCHEDULE="*/5 * * * *"
+EOF
+
+cat > "$MSMTPD_ENV" <<EOF
+SMTP_HOST=${SMTP_HOST}
+SMTP_PORT=${SMTP_PORT}
+SMTP_TLS=on
+SMTP_STARTTLS=on
+SMTP_TLS_CHECKCERT=on
+SMTP_AUTH=on
+SMTP_USER=${SMTP_USER}
+SMTP_PASSWORD=${SMTP_PASS}
+SMTP_FROM=${SMTP_FROM}
+EOF
+
+cat > "$LIBRENMS_COMPOSE" <<'EOF'
 services:
-  oxidized:
-    image: oxidized/oxidized:latest
-    container_name: oxidized
-    user: "1000:1000"
-    ports:
-      - "8888:8888"
+  db:
+    image: mariadb:10
+    container_name: librenms_db
+    command:
+      - "mysqld"
+      - "--innodb-file-per-table=1"
+      - "--lower-case-table-names=0"
+      - "--character-set-server=utf8mb4"
+      - "--collation-server=utf8mb4_unicode_ci"
     volumes:
-      - ./config:/home/oxidized/.config/oxidized:rw
-      - ./logs:/home/oxidized/logs:rw
-      - ./git:/home/oxidized/git:rw
-    restart: unless-stopped
+      - "./db:/var/lib/mysql"
+    env_file:
+      - "./.env"
+    environment:
+      - "MARIADB_RANDOM_ROOT_PASSWORD=yes"
+    restart: always
+    networks:
+      - orchestrator_net
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: librenms_redis
+    env_file:
+      - "./.env"
+    restart: always
+    networks:
+      - orchestrator_net
+
+  msmtpd:
+    image: crazymax/msmtpd:latest
+    container_name: librenms_msmtpd
+    env_file:
+      - "./msmtpd.env"
+    restart: always
+    networks:
+      - orchestrator_net
+
+  librenms:
+    image: librenms/librenms:latest
+    container_name: librenms
+    hostname: librenms
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+      - redis
+      - msmtpd
+    volumes:
+      - "./librenms:/data"
+    env_file:
+      - "./librenms.env"
+      - "./.env"
+    environment:
+      - "DB_HOST=db"
+      - "DB_NAME=${MYSQL_DATABASE}"
+      - "DB_USER=${MYSQL_USER}"
+      - "DB_PASSWORD=${MYSQL_PASSWORD}"
+      - "DB_TIMEOUT=60"
+    restart: always
+    networks:
+      - orchestrator_net
+
+  dispatcher:
+    image: librenms/librenms:latest
+    container_name: librenms_dispatcher
+    hostname: librenms-dispatcher
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    depends_on:
+      - librenms
+      - redis
+    volumes:
+      - "./librenms:/data"
+    env_file:
+      - "./librenms.env"
+      - "./.env"
+    environment:
+      - "DB_HOST=db"
+      - "DB_NAME=${MYSQL_DATABASE}"
+      - "DB_USER=${MYSQL_USER}"
+      - "DB_PASSWORD=${MYSQL_PASSWORD}"
+      - "DB_TIMEOUT=60"
+      - "DISPATCHER_NODE_ID=dispatcher1"
+      - "SIDECAR_DISPATCHER=1"
+    restart: always
+    networks:
+      - orchestrator_net
+
+  syslogng:
+    image: librenms/librenms:latest
+    container_name: librenms_syslogng
+    hostname: librenms-syslogng
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    depends_on:
+      - librenms
+      - redis
+    ports:
+      - "514:514/tcp"
+      - "514:514/udp"
+    volumes:
+      - "./librenms:/data"
+    env_file:
+      - "./librenms.env"
+      - "./.env"
+    environment:
+      - "DB_HOST=db"
+      - "DB_NAME=${MYSQL_DATABASE}"
+      - "DB_USER=${MYSQL_USER}"
+      - "DB_PASSWORD=${MYSQL_PASSWORD}"
+      - "DB_TIMEOUT=60"
+      - "SIDECAR_SYSLOGNG=1"
+    restart: always
+    networks:
+      - orchestrator_net
+
+  snmptrapd:
+    image: librenms/librenms:latest
+    container_name: librenms_snmptrapd
+    hostname: librenms-snmptrapd
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    depends_on:
+      - librenms
+      - redis
+    ports:
+      - "162:162/tcp"
+      - "162:162/udp"
+    volumes:
+      - "./librenms:/data"
+    env_file:
+      - "./librenms.env"
+      - "./.env"
+    environment:
+      - "DB_HOST=db"
+      - "DB_NAME=${MYSQL_DATABASE}"
+      - "DB_USER=${MYSQL_USER}"
+      - "DB_PASSWORD=${MYSQL_PASSWORD}"
+      - "DB_TIMEOUT=60"
+      - "SIDECAR_SNMPTRAPD=1"
+    restart: always
     networks:
       - orchestrator_net
 
@@ -227,99 +478,229 @@ networks:
     external: true
 EOF
 
-# Pull and run Oxidized
-docker pull oxidized/oxidized:latest
-docker compose -f "$OXIDIZED_DIR/docker-compose.yml" up -d
+cd "$LIBRENMS_DIR"
+$COMPOSE_CMD -f "$LIBRENMS_COMPOSE" pull
+$COMPOSE_CMD -f "$LIBRENMS_COMPOSE" up -d
+
+echo "[*] Waiting for LibreNMS web UI on http://localhost:8000..."
+for i in {1..90}; do
+  if curl -fs http://localhost:8000 >/dev/null 2>&1; then
+    echo "[*] LibreNMS is ready at: http://localhost:8000"
+    break
+  fi
+  sleep 2
+done
+
+phase_summary "2 & 3 (LibreNMS)"
+
+# ------------------------------------------------------------
+#  Phase 4: Oxidized (8888)
+# ------------------------------------------------------------
+OXI_CFG="$OXIDIZED_DIR/config"
+OXI_LOG="$OXIDIZED_DIR/logs"
+OXI_COMPOSE="$OXIDIZED_DIR/docker-compose.yml"
+
+mkdir -p "$OXI_CFG" "$OXI_LOG"
+
+if [[ ! -f "$OXI_CFG/router.db" ]]; then
+cat > "$OXI_CFG/router.db" <<'EOF'
+# hostname:model
+# example:
+# 10.0.0.1:ios
+10.0.0.1:ios
+10.0.0.2:ios
+10.0.0.3:junos
+EOF
+fi
+
+cat > "$OXI_CFG/config" <<'EOF'
+---
+username: oxidized
+password: password
+model: ios
+interval: 3600
+use_syslog: false
+debug: false
+threads: 30
+timeout: 20
+retries: 3
+prompt: !ruby/regexp /^([\w.@-]+[#>]\s?)$/
+rest: 0.0.0.0:8888
+
+vars:
+  enable: enable
+
+input:
+  default: ssh
+  ssh:
+    secure: false
+
+output:
+  default: git
+  git:
+    repo: "/home/oxidized/.config/oxidized/repo"
+
+source:
+  default: csv
+  csv:
+    file: "/home/oxidized/.config/oxidized/router.db"
+    delimiter: !ruby/regexp /:/
+    map:
+      name: 0
+      model: 1
+      group: 2
+    vars_map:
+      ssh_port: 3
+      telnet_port: 4
+EOF
+
+cat > "$OXI_COMPOSE" <<EOF
+services:
+  oxidized:
+    image: oxidized/oxidized:latest
+    container_name: oxidized
+    restart: unless-stopped
+    ports:
+      - "8888:8888"
+    environment:
+      CONFIG_RELOAD: "600"
+    volumes:
+      - "${OXI_CFG}:/home/oxidized/.config/oxidized"
+      - "${OXI_LOG}:/home/oxidized/.config/oxidized/logs"
+    networks:
+      - orchestrator_net
+
+networks:
+  orchestrator_net:
+    external: true
+EOF
+
+chown -R 1000:1000 "$OXIDIZED_DIR"
+chmod -R 755 "$OXIDIZED_DIR"
+
+cd "$OXIDIZED_DIR"
+$COMPOSE_CMD -f "$OXI_COMPOSE" pull
+$COMPOSE_CMD -f "$OXI_COMPOSE" up -d
+
+echo "[*] Waiting for Oxidized web UI on http://localhost:8888..."
+for i in {1..60}; do
+  if curl -fs http://localhost:8888 >/dev/null 2>&1; then
+    echo "[*] Oxidized is ready at: http://localhost:8888"
+    break
+  fi
+  sleep 2
+done
+
 phase_summary 4
 
-# -------------------------------
-# Phase 5: Passive Traffic (Zeek, Suricata, Ntopng)
-# -------------------------------
-PASSIVE_DIR="$BASE_DIR/passive"
+# ------------------------------------------------------------
+#  Phase 5: Passive Traffic (Zeek, Suricata, Ntopng)
+# ------------------------------------------------------------
 mkdir -p "$PASSIVE_DIR"
 
-read -rp "Enter interface for Zeek/Suricata capture [eth0]: " CAP_IF
-CAP_IF="${CAP_IF:-eth0}"
+read -rp "[*] Enter interface for passive monitoring (e.g., eth0) [eth0]: " MONITOR_IFACE
+MONITOR_IFACE="${MONITOR_IFACE:-eth0}"
 
-# Zeek
 cat > "$PASSIVE_DIR/zeek-compose.yml" <<EOF
 services:
   zeek:
     image: zeek/zeek:lts
     container_name: zeek
-    network_mode: "host"
-    command: zeek -i $CAP_IF
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      ZEEK_LOG_DIR: /zeek/logs
+    command: >
+      zeek -i ${MONITOR_IFACE}
+    volumes:
+      - ./logs:/zeek/logs
+      - ./scripts:/zeek/scripts
     restart: unless-stopped
 EOF
 
-# Suricata
 cat > "$PASSIVE_DIR/suricata-compose.yml" <<EOF
 services:
   suricata:
     image: jasonish/suricata:latest
     container_name: suricata
-    network_mode: "host"
-    restart: unless-stopped
+    network_mode: host
     cap_add:
       - NET_ADMIN
       - NET_RAW
       - SYS_NICE
+    command: >
+      -i ${MONITOR_IFACE}
+    volumes:
+      - ./logs:/var/log/suricata
+    restart: unless-stopped
 EOF
 
-# Ntopng
 cat > "$PASSIVE_DIR/ntopng-compose.yml" <<EOF
 services:
   ntopng:
     image: ntop/ntopng:latest
     container_name: ntopng
-    network_mode: "host"
+    network_mode: host
     restart: unless-stopped
 EOF
 
-docker pull zeek/zeek:lts
-docker pull jasonish/suricata:latest
-docker pull ntop/ntopng:latest
+echo "[*] Pulling passive traffic images..."
+docker pull zeek/zeek:lts || warn "Zeek image pull failed"
+docker pull jasonish/suricata:latest || warn "Suricata image pull failed"
+docker pull ntop/ntopng:latest || warn "Ntopng image pull failed"
 
-docker compose -f "$PASSIVE_DIR/zeek-compose.yml" up -d || true
-docker compose -f "$PASSIVE_DIR/suricata-compose.yml" up -d || true
-docker compose -f "$PASSIVE_DIR/ntopng-compose.yml" up -d || true
+echo "[*] Starting passive traffic containers..."
+cd "$PASSIVE_DIR"
+$COMPOSE_CMD -f zeek-compose.yml up -d || warn "Zeek start failed"
+$COMPOSE_CMD -f suricata-compose.yml up -d || warn "Suricata start failed"
+$COMPOSE_CMD -f ntopng-compose.yml up -d || warn "Ntopng start failed"
+
+echo "[*] Passive traffic Phase complete: Zeek, Suricata, Ntopng running on $MONITOR_IFACE"
 phase_summary 5
 
-# -------------------------------
-# Phase 6: Compute Discovery
-# -------------------------------
-COMPUTE_DIR="$BASE_DIR/compute"
+# ------------------------------------------------------------
+#  Phase 6: Compute Discovery
+# ------------------------------------------------------------
 mkdir -p "$COMPUTE_DIR"
 cat > "$COMPUTE_DIR/discovery.sh" <<'EOF'
-#!/bin/bash
-# Discover Hypervisors (Type 1 & 2), VMs, and integrate with NetBox API
+#!/usr/bin/env bash
+set -euo pipefail
 echo "[*] Placeholder: Hyper-V, ESXi, VMware Workstation/Player discovery"
+echo "[*] Implement API/SSH-based hypervisor + VM inventory and push into NetBox."
 EOF
 chmod +x "$COMPUTE_DIR/discovery.sh"
+
 phase_summary 6
 
-# -------------------------------
-# Phase 7: Ingestion / Dry Run
-# -------------------------------
-INGEST_DIR="$BASE_DIR/ingestion"
+# ------------------------------------------------------------
+#  Phase 7: Ingestion / Dry Run
+# ------------------------------------------------------------
 mkdir -p "$INGEST_DIR"
 cat > "$INGEST_DIR/ingest.sh" <<'EOF'
-#!/bin/bash
-# Placeholder: SNMP, SSH, API ingestion
-echo "[*] Placeholder: Dry-run discovery, validate devices before NetBox write"
+#!/usr/bin/env bash
+set -euo pipefail
+echo "[*] Placeholder: SNMP, SSH, API ingestion"
+echo "[*] Implement dry-run discovery, validate devices before writing to NetBox/LibreNMS."
 EOF
 chmod +x "$INGEST_DIR/ingest.sh"
+
 phase_summary 7
 
-# -------------------------------
-# Phase 8: Completeness / Promotion
-# -------------------------------
+# ------------------------------------------------------------
+#  Phase 8: Completeness / Promotion
+# ------------------------------------------------------------
 echo "[*] Phase 8: Validations / Completeness checks"
-echo "[*] Script finished all 8 phases — network skeleton and passive/compute ready"
+echo "[*] NetBox:     http://localhost:8080"
+echo "[*] LibreNMS:   http://localhost:8000"
+echo "[*] Oxidized:   http://localhost:8888"
+echo "[*] Passive:    Zeek / Suricata / Ntopng (host mode)"
+echo "[*] Compute:    $COMPUTE_DIR/discovery.sh"
+echo "[*] Ingestion:  $INGEST_DIR/ingest.sh"
+
 phase_summary 8
 
-echo "[*] Orchestrator v2.2 bootstrap complete!"
-echo "[*] Base directory: $BASE_DIR"
-echo "[*] LibreNMS should now be reachable on http://localhost:8001"
-echo "[*] NetBox reachable on http://localhost:8000"
-echo "[*] Oxidized web GUI on http://localhost:8888"
+echo "[*] Orchestrator v2.4 bootstrap complete!"
+echo "[*] Base directory: $BASE_ROOT"
+echo "[*] You can now run ingestion and compute discovery scripts as needed."
