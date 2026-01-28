@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================
-# Network Mapping Orchestrator — Version 2.1.5
+# Network Mapping Orchestrator — Version 2.1.6
 # Fully Dockerized | Auto-Elevating | 8 Phases
 # NetBox uses PostgreSQL | LibreNMS uses MariaDB
 # Includes Ingestion, Passive Traffic, Compute Discovery
@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.1.5"
+SCRIPT_VERSION="2.1.6"
 echo "[*] Network Mapping Orchestrator — Version $SCRIPT_VERSION"
 
 # -------------------------------
@@ -225,55 +225,49 @@ echo "[*] LibreNMS Redis ready"
 phase_summary "2 & 3 (LibreNMS)"
 
 # -------------------------------
-# Phase 4: Oxidized (NetBox-backed)
+# Phase 4: Oxidized + Git (Patched)
 # -------------------------------
 OXIDIZED_DIR="$BASE_DIR/oxidized"
-mkdir -p \
-  "$OXIDIZED_DIR/config/oxidized" \
-  "$OXIDIZED_DIR/logs" \
-  "$OXIDIZED_DIR/git"
+mkdir -p "$OXIDIZED_DIR/config/oxidized" "$OXIDIZED_DIR/logs" "$OXIDIZED_DIR/git"
 
-# Oxidized container runs as UID 1000
+# Ensure proper ownership (UID 1000 is default Oxidized user)
 chown -R 1000:1000 "$OXIDIZED_DIR"
 chmod -R 755 "$OXIDIZED_DIR"
 
-# ---- NetBox API token ----
-read -rp "Enter NetBox API token for Oxidized: " NETBOX_API_TOKEN
-
-# ---- Oxidized config ----
-cat > "$OXIDIZED_DIR/config/oxidized/config.yml" <<EOF
+# Create Oxidized config file pointing to NetBox
+cat > "$OXIDIZED_DIR/config/oxidized/config" <<'EOF'
 ---
-username: admin
+username: oxidized
+password: oxidizedpass
+model: junos
 interval: 3600
-timeout: 20
-retries: 1
-prompt: !ruby/regexp /^([\\w.@-]+[#>]\\s?)$/
+use_syslog: false
+debug: false
+threads: 30
+timeout: 30
+retries: 3
+prompt: !ruby/regexp /^([\w.@()-]+[#>]\s?)$/
 rest: 0.0.0.0:8888
-
+rest_username: admin
+rest_password: admin
 source:
-  default: netbox
   netbox:
-    url: http://netbox:8080
-    token: ${NETBOX_API_TOKEN}
+    url: http://netbox:8000
+    token: YOUR_NETBOX_API_TOKEN
     ssl_verify: false
-    timeout: 20
-
 output:
   default: git
   git:
     user: Oxidized
-    email: oxidized@localhost
+    email: oxidized@example.com
     repo: /home/oxidized/git
-
 model_map:
-  ios: ios
-  nxos: nxos
-  junos: junos
-  eos: eos
+  cisco: ios
+  juniper: junos
 EOF
 
-# ---- Docker Compose ----
-cat > "$OXIDIZED_DIR/docker-compose.yml" <<'EOF'
+# Create docker-compose.yml for Oxidized
+cat > "$OXIDIZED_DIR/docker-compose.yml" <<EOF
 services:
   oxidized:
     image: oxidized/oxidized:latest
@@ -294,18 +288,9 @@ networks:
     external: true
 EOF
 
+# Pull image and start
 docker pull oxidized/oxidized:latest
 docker compose -f "$OXIDIZED_DIR/docker-compose.yml" up -d
-
-# ---- Wait for Oxidized REST API ----
-echo "[*] Waiting for Oxidized REST API..."
-for i in {1..30}; do
-  if curl -fs http://localhost:8888/nodes >/dev/null 2>&1; then
-    echo "[✓] Oxidized API online"
-    break
-  fi
-  sleep 2
-done
 
 phase_summary 4
 
