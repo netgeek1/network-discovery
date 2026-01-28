@@ -1,6 +1,6 @@
 #!/bin/bash
 # ====================================================
-# Network Mapping Orchestrator — Version 2.1
+# Network Mapping Orchestrator — Version 2.1.1
 # Fully Dockerized | Auto-Elevating | 8 Phases
 # NetBox uses PostgreSQL | LibreNMS uses MariaDB
 # Includes Ingestion, Passive Traffic, Compute Discovery
@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2.1"
+SCRIPT_VERSION="2.1.1"
 echo "[*] Network Mapping Orchestrator — Version $SCRIPT_VERSION"
 
 # -------------------------------
@@ -225,10 +225,54 @@ echo "[*] LibreNMS Redis ready"
 phase_summary "2 & 3 (LibreNMS)"
 
 # -------------------------------
-# Phase 4: Oxidized + Git
+# Phase 4: Oxidized (Hardened)
 # -------------------------------
 OXIDIZED_DIR="$BASE_DIR/oxidized"
-mkdir -p "$OXIDIZED_DIR"
+mkdir -p "$OXIDIZED_DIR"/{config/oxidized,configs,logs}
+
+# Oxidized config (pre-seeded to avoid crash)
+cat > "$OXIDIZED_DIR/config/oxidized/config" <<'EOF'
+---
+username: admin
+password: admin
+model: generic
+interval: 3600
+use_syslog: false
+debug: false
+threads: 30
+timeout: 20
+retries: 3
+
+rest: 0.0.0.0:8888
+
+vars:
+  enable: true
+
+groups: {}
+
+models:
+  generic:
+    username: admin
+    password: admin
+
+input:
+  default: ssh, telnet
+
+output:
+  default: file
+  file:
+    directory: /home/oxidized/configs
+
+source:
+  default: sqlite
+  sqlite:
+    file: /home/oxidized/.config/oxidized/router.db
+EOF
+
+# Permissions (official image runs as UID 1000)
+chown -R 1000:1000 "$OXIDIZED_DIR"
+
+# Docker Compose
 cat > "$OXIDIZED_DIR/docker-compose.yml" <<'EOF'
 services:
   oxidized:
@@ -238,14 +282,18 @@ services:
       - "8888:8888"
     volumes:
       - ./config:/home/oxidized/.config
+      - ./configs:/home/oxidized/configs
       - ./logs:/home/oxidized/logs
     restart: unless-stopped
+    networks:
+      - orchestrator_net
 
 networks:
   orchestrator_net:
     external: true
 EOF
 
+docker pull oxidized/oxidized:latest
 docker compose -f "$OXIDIZED_DIR/docker-compose.yml" up -d
 phase_summary 4
 
@@ -314,7 +362,7 @@ docker pull jasonish/suricata:latest || echo "[!] Suricata image pull failed"
 docker pull ntop/ntopng:latest || echo "[!] Ntopng image pull failed"
 
 echo "[*] Starting passive traffic containers..."
-docker compose -f "$PASSIVE_DIR/zeek-compose.yml" up -d
+docker compose -f "$PASSIVE_DIR/zeek-compose.yml" up -d 
 docker compose -f "$PASSIVE_DIR/suricata-compose.yml" up -d
 docker compose -f "$PASSIVE_DIR/ntopng-compose.yml" up -d
 
