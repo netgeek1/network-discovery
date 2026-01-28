@@ -3,6 +3,12 @@ set -euo pipefail
 
 # This is a basic working Oxidized docker script
 
+REAL_USER="${SUDO_USER:-${LOGNAME:-$(whoami)}}"
+
+log()   { printf '[INFO] %s\n' "$*"; }
+warn()  { printf '[WARN] %s\n' "$*" >&2; }
+error() { printf '[ERROR] %s\n' "$*" >&2; }
+
 # ------------------------------------------------------------
 # Root handling
 # ------------------------------------------------------------
@@ -54,6 +60,10 @@ ensure_docker_group() {
     warn "You may need to log out/in for group changes to apply."
   fi
 }
+
+require_root
+install_docker
+ensure_docker_group
 
 # ============================
 #   CONFIGURATION
