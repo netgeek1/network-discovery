@@ -2,13 +2,15 @@
 set -euo pipefail
 
 # ============================================================
-#  Network Mapping Orchestrator — Version 2.4
-#  Base: /opt/orchestrator-v2.4
+#  Network Mapping Orchestrator — Version 3.0
+#  Base: /opt/orchestrator
 #  NetBox (8080) | LibreNMS (8000) | Oxidized (8888)
 #  Passive Traffic | Compute Discovery | Ingestion Pipeline
 # ============================================================
+#  v3.0 - Phase 6 added
+# ============================================================
 
-SCRIPT_VERSION="2.4"
+SCRIPT_VERSION="3.0"
 
 echo
 echo "============================================================"
@@ -664,12 +666,311 @@ phase_summary 5
 #  Phase 6: Compute Discovery
 # ------------------------------------------------------------
 mkdir -p "$COMPUTE_DIR"
+
 cat > "$COMPUTE_DIR/discovery.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-echo "[*] Placeholder: Hyper-V, ESXi, VMware Workstation/Player discovery"
-echo "[*] Implement API/SSH-based hypervisor + VM inventory and push into NetBox."
+
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OUT_DIR="$BASE_DIR/output"
+mkdir -p "$OUT_DIR"
+
+INVENTORY_YAML="$OUT_DIR/compute-inventory.yaml"
+
+log()   { printf '[DISCOVERY] %s\n' "$*"; }
+warn()  { printf '[WARN] %s\n' "$*" >&2; }
+
+# ------------------------------------------------------------
+# Dependencies
+# ------------------------------------------------------------
+ensure_dep() {
+  local bin="$1"
+  local pkg="$2"
+
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    warn "$bin not found — installing $pkg..."
+    if command -v apt-get >/dev/null 2>&1; then
+      sudo apt-get update -y && sudo apt-get install -y "$pkg"
+    else
+      warn "apt-get not available; install $pkg manually."
+    fi
+  fi
+}
+
+ensure_dep nmap nmap
+ensure_dep nc netcat-openbsd
+ensure_dep curl curl
+ensure_dep snmpget snmp
+
+SNMP_COMMUNITY="${SNMP_COMMUNITY:-public}"
+
+# ------------------------------------------------------------
+# Usage
+# ------------------------------------------------------------
+usage() {
+  cat <<USAGE
+Usage:
+  $0 cidr 10.0.0.0/24
+  $0 list hosts.txt
+
+Output:
+  $INVENTORY_YAML
+USAGE
+}
+
+[[ $# -lt 2 ]] && usage && exit 1
+
+MODE="$1"
+TARGET="$2"
+
+TMP_HOSTS="$OUT_DIR/hosts.tmp"
+> "$TMP_HOSTS"
+
+# ------------------------------------------------------------
+# Host enumeration
+# ------------------------------------------------------------
+case "$MODE" in
+  cidr)
+    log "Enumerating live hosts in CIDR: $TARGET"
+    nmap -sn "$TARGET" -oG - 2>/dev/null | awk '/Up$/{print $2}' > "$TMP_HOSTS" || true
+    ;;
+  list)
+    cp "$TARGET" "$TMP_HOSTS"
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac
+
+if [[ ! -s "$TMP_HOSTS" ]]; then
+  warn "No hosts discovered."
+  exit 0
+fi
+
+log "Discovered hosts:"
+cat "$TMP_HOSTS"
+
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+probe_port()  { nc -z -w1 "$1" "$2" >/dev/null 2>&1 && echo true || echo false; }
+probe_http()  { curl -fs --max-time 2 "http://$1" >/dev/null 2>&1 && echo true || echo false; }
+probe_https() { curl -fs --insecure --max-time 2 "https://$1" >/dev/null 2>&1 && echo true || echo false; }
+
+fetch_http()  { curl -ks --max-time 2 "http://$1" 2>/dev/null || true; }
+fetch_https() { curl -ks --max-time 2 "https://$1" 2>/dev/null || true; }
+
+# ------------------------------------------------------------
+# SNMP Detection (sysObjectID + sysDescr + sysName + sysLocation)
+# ------------------------------------------------------------
+snmp_query() {
+  local host="$1"
+  local oid="$2"
+  timeout 1 snmpget -v2c -c "$SNMP_COMMUNITY" -Ovq "$host" "$oid" 2>/dev/null || true
+}
+
+detect_snmp_vendor() {
+  local host="$1"
+  local oid
+  oid=$(snmp_query "$host" 1.3.6.1.2.1.1.2.0)
+
+  [[ -z "$oid" ]] && echo "none" && return
+
+  case "$oid" in
+    .1.3.6.1.4.1.12356.*) echo "fortinet"; return ;;
+    .1.3.6.1.4.1.41112.*) echo "ubiquiti"; return ;;
+    .1.3.6.1.4.1.4526.*) echo "netgear"; return ;;
+    .1.3.6.1.4.1.11.*|.1.3.6.1.4.1.14823.*) echo "hp-aruba"; return ;;
+    .1.3.6.1.4.1.8072.*) echo "freebsd"; return ;; # pfSense/OPNsense base
+  esac
+
+  echo "unknown"
+}
+
+snmp_enrich() {
+  local host="$1"
+
+  local descr name loc
+  descr=$(snmp_query "$host" 1.3.6.1.2.1.1.1.0)
+  name=$(snmp_query "$host" 1.3.6.1.2.1.1.5.0)
+  loc=$(snmp_query "$host" 1.3.6.1.2.1.1.6.0)
+
+  echo "$descr|$name|$loc"
+}
+
+# ------------------------------------------------------------
+# MAC OUI Detection
+# ------------------------------------------------------------
+detect_mac_oui() {
+  local host="$1"
+  local mac
+
+  mac=$(arp -n "$host" 2>/dev/null | awk '/:/{print $3}' || true)
+
+  if [[ -z "$mac" ]]; then
+    mac=$(nmap -n -O --osscan-limit "$host" 2>/dev/null | awk '/MAC Address:/{print $3}' || true)
+  fi
+
+  [[ -z "$mac" ]] && echo "none" && return
+
+  local prefix=$(echo "$mac" | awk -F: '{print toupper($1$2$3)}')
+
+  case "$prefix" in
+    00163E|F4EAB5|18E829) echo "fortinet"; return ;;
+    24A43C|F09FC2|ACE215) echo "ubiquiti"; return ;;
+    00184D|A0D3C1|B0C559) echo "netgear"; return ;;
+    0024A8|F8E079|D8C7C8) echo "hp-aruba"; return ;;
+    000C29|005056) echo "vmware"; return ;;
+  esac
+
+  echo "unknown"
+}
+
+# ------------------------------------------------------------
+# HTTP Vendor Detection (fallback)
+# ------------------------------------------------------------
+detect_vendor_http() {
+  local host="$1"
+  local banner="$(fetch_http "$host")$(fetch_https "$host")"
+
+  echo "$banner" | grep -qiE "Ubiquiti|UniFi|EdgeOS|UISP" && echo "ubiquiti" && return
+  echo "$banner" | grep -qiE "Fortinet|FortiGate|FortiSwitch" && echo "fortinet" && return
+  echo "$banner" | grep -qi "NETGEAR" && echo "netgear" && return
+  echo "$banner" | grep -qiE "Aruba|ProCurve|HP" && echo "hp-aruba" && return
+  echo "$banner" | grep -qi "OPNsense" && echo "opnsense" && return
+  echo "$banner" | grep -qi "pfSense" && echo "pfsense" && return
+
+  echo "unknown"
+}
+
+# ------------------------------------------------------------
+# Hypervisor Detection
+# ------------------------------------------------------------
+detect_hypervisor() {
+  local host="$1"
+
+  curl -ks --max-time 2 "https://$host/ui/" | grep -qi "VMware ESXi" && echo "esxi" && return
+  curl -ks --max-time 2 "https://$host:8006/" | grep -qi "Proxmox" && echo "proxmox" && return
+  nc -z -w1 "$host" 5985 >/dev/null 2>&1 && echo "hyper-v" && return
+  nc -z -w1 "$host" 5986 >/dev/null 2>&1 && echo "hyper-v" && return
+  curl -ks --max-time 2 "https://$host:443/sdk" | grep -qi "VMware" && echo "vmware-workstation" && return
+  nc -z -w1 "$host" 16509 >/dev/null 2>&1 && echo "kvm-libvirt" && return
+
+  echo "none"
+}
+
+# ------------------------------------------------------------
+# Device Type Classification
+# ------------------------------------------------------------
+detect_device_type() {
+  local vendor="$1"
+
+  case "$vendor" in
+    fortinet) echo "network-appliance"; return ;;
+    ubiquiti) echo "network-appliance"; return ;;
+    netgear) echo "switch"; return ;;
+    hp-aruba) echo "switch"; return ;;
+    opnsense|pfsense) echo "firewall"; return ;;
+    freebsd) echo "firewall"; return ;;
+    vmware|esxi|proxmox|hyper-v|kvm-libvirt) echo "hypervisor"; return ;;
+  esac
+
+  echo "unknown"
+}
+
+# ------------------------------------------------------------
+# Inventory Generation
+# ------------------------------------------------------------
+log "Starting Phase 6 unified detection..."
+
+> "$INVENTORY_YAML"
+echo "# Phase 6 Inventory" >> "$INVENTORY_YAML"
+echo "# Generated: $(date -Iseconds)" >> "$INVENTORY_YAML"
+echo "hosts:" >> "$INVENTORY_YAML"
+
+while read -r HOST; do
+  [[ -z "$HOST" ]] && continue
+
+  log "Scanning $HOST..."
+
+  SSH_OPEN=$(probe_port "$HOST" 22)
+  RDP_OPEN=$(probe_port "$HOST" 3389)
+  HTTP_OPEN=$(probe_http "$HOST")
+  HTTPS_OPEN=$(probe_https "$HOST")
+
+  EARLY_EXIT=false
+  VENDOR="unknown"
+  DEVICE_TYPE="unknown"
+  HYPERVISOR="none"
+  SNMP_DESCR=""
+  SNMP_NAME=""
+  SNMP_LOC=""
+
+  # 1. Hypervisor (fast)
+  HYPERVISOR=$(detect_hypervisor "$HOST")
+  if [[ "$HYPERVISOR" != "none" ]]; then
+    VENDOR="$HYPERVISOR"
+    DEVICE_TYPE="hypervisor"
+    EARLY_EXIT=true
+  fi
+
+  # 2. SNMP (safe)
+  if [[ "$EARLY_EXIT" != true ]]; then
+    SNMP_VENDOR=$(detect_snmp_vendor "$HOST")
+    if [[ "$SNMP_VENDOR" != "none" ]]; then
+      VENDOR="$SNMP_VENDOR"
+      DEVICE_TYPE=$(detect_device_type "$SNMP_VENDOR")
+      IFS="|" read -r SNMP_DESCR SNMP_NAME SNMP_LOC <<< "$(snmp_enrich "$HOST")"
+      EARLY_EXIT=true
+    fi
+  fi
+
+  # 3. MAC OUI
+  if [[ "$EARLY_EXIT" != true ]]; then
+    OUI_VENDOR=$(detect_mac_oui "$HOST")
+    if [[ "$OUI_VENDOR" != "unknown" ]]; then
+      VENDOR="$OUI_VENDOR"
+      DEVICE_TYPE=$(detect_device_type "$OUI_VENDOR")
+      EARLY_EXIT=true
+    fi
+  fi
+
+  # 4. HTTP fallback
+  if [[ "$EARLY_EXIT" != true ]]; then
+    VENDOR=$(detect_vendor_http "$HOST")
+    DEVICE_TYPE=$(detect_device_type "$VENDOR")
+  fi
+
+  # 5. OS fallback
+  if [[ "$DEVICE_TYPE" == "unknown" ]]; then
+    if [[ "$SSH_OPEN" == "true" && "$RDP_OPEN" == "false" ]]; then
+      DEVICE_TYPE="unix-like"
+    elif [[ "$RDP_OPEN" == "true" ]]; then
+      DEVICE_TYPE="windows-like"
+    fi
+  fi
+
+  cat >> "$INVENTORY_YAML" <<YAML
+  - address: "$HOST"
+    vendor: "$VENDOR"
+    device_type: "$DEVICE_TYPE"
+    hypervisor: "$HYPERVISOR"
+    ssh_open: $SSH_OPEN
+    rdp_3389_open: $RDP_OPEN
+    http_open: $HTTP_OPEN
+    https_open: $HTTPS_OPEN
+    snmp_sysDescr: "$SNMP_DESCR"
+    snmp_sysName: "$SNMP_NAME"
+    snmp_sysLocation: "$SNMP_LOC"
+YAML
+
+done < "$TMP_HOSTS"
+
+log "Phase 6 complete — inventory written to $INVENTORY_YAML"
+log "Next step: map these into NetBox/LibreNMS as devices, VMs, or hypervisors."
 EOF
+
 chmod +x "$COMPUTE_DIR/discovery.sh"
 
 phase_summary 6
