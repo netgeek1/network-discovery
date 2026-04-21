@@ -2,15 +2,16 @@
 set -euo pipefail
 
 # ============================================================
-#  Network Mapping Orchestrator — Version 3.0
+#  Network Mapping Orchestrator — Version 5.0
 #  Base: /opt/orchestrator
 #  NetBox (8080) | LibreNMS (8000) | Oxidized (8888)
 #  Passive Traffic | Compute Discovery | Ingestion Pipeline
 # ============================================================
-#  v3.0 - Phase 6 added
+#  20260421-1210 - v5.0 - Functionalized
+#  20260421-xxxx - v4.0 - Phase 7 added
+#  20260421-xxxx - Phase 6 added
 # ============================================================
-
-SCRIPT_VERSION="3.0"
+SCRIPT_VERSION="5.0"
 
 echo
 echo "============================================================"
@@ -99,21 +100,25 @@ ensure_docker_group
 # ------------------------------------------------------------
 #  Determine compose command
 # ------------------------------------------------------------
-if docker compose version >/dev/null 2>&1; then
-  COMPOSE_CMD="docker compose"
-elif command -v docker-compose >/dev/null 2>&1; then
-  COMPOSE_CMD="docker-compose"
-else
-  apt-get install -y docker-compose-plugin || true
+determine_docker_compose() {
   if docker compose version >/dev/null 2>&1; then
     COMPOSE_CMD="docker compose"
   elif command -v docker-compose >/dev/null 2>&1; then
     COMPOSE_CMD="docker-compose"
   else
-    error "Docker Compose not available"
-    exit 1
+    apt-get install -y docker-compose-plugin || true
+    if docker compose version >/dev/null 2>&1; then
+      COMPOSE_CMD="docker compose"
+    elif command -v docker-compose >/dev/null 2>&1; then
+      COMPOSE_CMD="docker-compose"
+    else
+      error "Docker Compose not available"
+      exit 1
+    fi
   fi
-fi
+}
+
+determine_docker_compose
 
 # ------------------------------------------------------------
 #  Interactive configuration
@@ -125,36 +130,62 @@ prompt() {
   echo "${input:-$default}"
 }
 
-BASE_ROOT="/opt/orchestrator"
-BASE_ROOT=$(prompt "Enter base directory for orchestrator" "$BASE_ROOT")
+interactive_configuration() {
+  BASE_ROOT="/opt/orchestrator"
+  BASE_ROOT=$(prompt "Enter base directory for orchestrator" "$BASE_ROOT")
+  
+  TZ_VALUE=$(prompt "Enter your timezone" "America/New_York")
+  
+  echo "Generating random MySQL password for LibreNMS..."
+  LIBRENMS_DB_PASSWORD=$(openssl rand -base64 24 | tr -d '\n')
+  
+  echo
+  echo "SMTP configuration for LibreNMS:"
+  SMTP_HOST=$(prompt "SMTP host" "smtp.gmail.com")
+  SMTP_PORT=$(prompt "SMTP port" "587")
+  SMTP_USER=$(prompt "SMTP username" "user@example.com")
+  SMTP_PASS=$(prompt "SMTP password" "changeme")
+  SMTP_FROM=$(prompt "SMTP from address" "$SMTP_USER")
+  
+  mkdir -p "$BASE_ROOT"
+  
+  NETBOX_DIR="$BASE_ROOT/netbox"
+  LIBRENMS_DIR="$BASE_ROOT/librenms"
+  OXIDIZED_DIR="$BASE_ROOT/oxidized"
+  PASSIVE_DIR="$BASE_ROOT/passive"
+  COMPUTE_DIR="$BASE_ROOT/compute"
+  INGEST_DIR="$BASE_ROOT/ingestion"
+  
+  mkdir -p "$NETBOX_DIR" "$LIBRENMS_DIR" "$OXIDIZED_DIR" "$PASSIVE_DIR" "$COMPUTE_DIR" "$INGEST_DIR"
+}
 
-TZ_VALUE=$(prompt "Enter your timezone" "America/New_York")
+interactive_configuration
 
-echo "Generating random MySQL password for LibreNMS..."
-LIBRENMS_DB_PASSWORD=$(openssl rand -base64 24 | tr -d '\n')
+# ------------------------------------------------------------
+# Phase Gate + Functionalization Layer
+# ------------------------------------------------------------
+STATE_DIR="$BASE_ROOT/state"
+mkdir -p "$STATE_DIR"
 
-echo
-echo "SMTP configuration for LibreNMS:"
-SMTP_HOST=$(prompt "SMTP host" "smtp.gmail.com")
-SMTP_PORT=$(prompt "SMTP port" "587")
-SMTP_USER=$(prompt "SMTP username" "user@example.com")
-SMTP_PASS=$(prompt "SMTP password" "changeme")
-SMTP_FROM=$(prompt "SMTP from address" "$SMTP_USER")
+phase_run() {
+    local num="$1"
+    local func="$2"
 
-mkdir -p "$BASE_ROOT"
+    if [[ -f "$STATE_DIR/phase${num}.done" ]]; then
+        log "Phase $num already completed — skipping."
+        return
+    fi
 
-NETBOX_DIR="$BASE_ROOT/netbox"
-LIBRENMS_DIR="$BASE_ROOT/librenms"
-OXIDIZED_DIR="$BASE_ROOT/oxidized"
-PASSIVE_DIR="$BASE_ROOT/passive"
-COMPUTE_DIR="$BASE_ROOT/compute"
-INGEST_DIR="$BASE_ROOT/ingestion"
-
-mkdir -p "$NETBOX_DIR" "$LIBRENMS_DIR" "$OXIDIZED_DIR" "$PASSIVE_DIR" "$COMPUTE_DIR" "$INGEST_DIR"
+    log "Running Phase $num..."
+    $func
+    touch "$STATE_DIR/phase${num}.done"
+    log "Phase $num complete."
+}
 
 # ------------------------------------------------------------
 #  Phase 0: Tags / Network
 # ------------------------------------------------------------
+run_phase0() {
 PHASE0_DIR="$BASE_ROOT/phase0"
 mkdir -p "$PHASE0_DIR"
 
@@ -165,10 +196,12 @@ EOF
 docker network create orchestrator_net 2>/dev/null || true
 
 phase_summary 0
+}
 
 # ------------------------------------------------------------
 #  Phase 1: NetBox (8080)
 # ------------------------------------------------------------
+run_phase1() {
 NETBOX_ENV="$NETBOX_DIR/netbox.env"
 
 NETBOX_SECRET=$(openssl rand -base64 64 | tr -d '\n')
@@ -273,10 +306,12 @@ for i in {1..60}; do
 done
 
 phase_summary 1
+}
 
 # ------------------------------------------------------------
 #  Phase 2 & 3: LibreNMS (full multi-container, 8000)
 # ------------------------------------------------------------
+run_phase2() {
 LIBRENMS_ENV="$LIBRENMS_DIR/librenms.env"
 LIBRENMS_DOTENV="$LIBRENMS_DIR/.env"
 MSMTPD_ENV="$LIBRENMS_DIR/msmtpd.env"
@@ -494,10 +529,15 @@ for i in {1..90}; do
 done
 
 phase_summary "2 & 3 (LibreNMS)"
+}
+
+run_phase3() {
+}
 
 # ------------------------------------------------------------
 #  Phase 4: Oxidized (8888)
 # ------------------------------------------------------------
+run_phase4() {
 OXI_CFG="$OXIDIZED_DIR/config"
 OXI_LOG="$OXIDIZED_DIR/logs"
 OXI_COMPOSE="$OXIDIZED_DIR/docker-compose.yml"
@@ -594,10 +634,12 @@ for i in {1..60}; do
 done
 
 phase_summary 4
+}
 
 # ------------------------------------------------------------
 #  Phase 5: Passive Traffic (Zeek, Suricata, Ntopng)
 # ------------------------------------------------------------
+run_phase5() {
 mkdir -p "$PASSIVE_DIR"
 
 read -rp "[*] Enter interface for passive monitoring (e.g., eth0) [eth0]: " MONITOR_IFACE
@@ -661,10 +703,12 @@ $COMPOSE_CMD -f ntopng-compose.yml up -d || warn "Ntopng start failed"
 
 echo "[*] Passive traffic Phase complete: Zeek, Suricata, Ntopng running on $MONITOR_IFACE"
 phase_summary 5
+}
 
 # ------------------------------------------------------------
 #  Phase 6: Compute Discovery
 # ------------------------------------------------------------
+run_phase6() {
 mkdir -p "$COMPUTE_DIR"
 
 cat > "$COMPUTE_DIR/discovery.sh" <<'EOF'
@@ -797,6 +841,21 @@ snmp_enrich() {
   loc=$(snmp_query "$host" 1.3.6.1.2.1.1.6.0)
 
   echo "$descr|$name|$loc"
+}
+
+yaml_escape() {
+  local s="$1"
+  # Replace tabs with spaces
+  s="${s//$'\t'/  }"
+  # Escape double quotes
+  s="${s//\"/\\\"}"
+  # Escape backslashes
+  s="${s//\\/\\\\}"
+  # Replace carriage returns
+  s="${s//$'\r'/}"
+  # Replace newlines with literal \n
+  s="${s//$'\n'/\\n}"
+  echo "$s"
 }
 
 # ------------------------------------------------------------
@@ -951,6 +1010,10 @@ while read -r HOST; do
     fi
   fi
 
+SNMP_DESCR_ESCAPED=$(yaml_escape "$SNMP_DESCR")
+SNMP_NAME_ESCAPED=$(yaml_escape "$SNMP_NAME")
+SNMP_LOC_ESCAPED=$(yaml_escape "$SNMP_LOC")
+
   cat >> "$INVENTORY_YAML" <<YAML
   - address: "$HOST"
     vendor: "$VENDOR"
@@ -960,9 +1023,9 @@ while read -r HOST; do
     rdp_3389_open: $RDP_OPEN
     http_open: $HTTP_OPEN
     https_open: $HTTPS_OPEN
-    snmp_sysDescr: "$SNMP_DESCR"
-    snmp_sysName: "$SNMP_NAME"
-    snmp_sysLocation: "$SNMP_LOC"
+    snmp_sysDescr: "$SNMP_DESCR_ESCAPED"
+    snmp_sysName: "$SNMP_NAME_ESCAPED"
+    snmp_sysLocation: "$SNMP_LOC_ESCAPED"
 YAML
 
 done < "$TMP_HOSTS"
@@ -973,25 +1036,288 @@ EOF
 
 chmod +x "$COMPUTE_DIR/discovery.sh"
 
+bash "$COMPUTE_DIR/discovery.sh"
+
 phase_summary 6
+}
 
 # ------------------------------------------------------------
-#  Phase 7: Ingestion / Dry Run
+#  Phase 7: Ingestion Engine (DT3 → DT2 → DT1)
 # ------------------------------------------------------------
-mkdir -p "$INGEST_DIR"
-cat > "$INGEST_DIR/ingest.sh" <<'EOF'
+run_phase7() {
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PHASE7_DIR="$BASE_DIR/ingestion"
+mkdir -p "$PHASE7_DIR"
+
+cat > "$PHASE7_DIR/ingest.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-echo "[*] Placeholder: SNMP, SSH, API ingestion"
-echo "[*] Implement dry-run discovery, validate devices before writing to NetBox/LibreNMS."
-EOF
-chmod +x "$INGEST_DIR/ingest.sh"
 
-phase_summary 7
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INVENTORY_FILE="$BASE_DIR/../compute/output/compute-inventory.yaml"
+LOG_FILE="$BASE_DIR/ingestion.log"
+
+NETBOX_URL="${NETBOX_URL:-http://localhost:8080}"
+NETBOX_TOKEN="${NETBOX_TOKEN:-netbox_admin_token_here}"
+
+LIBRENMS_URL="${LIBRENMS_URL:-http://localhost:8000}"
+LIBRENMS_TOKEN="${LIBRENMS_TOKEN:-librenms_api_token_here}"
+
+SNMP_COMMUNITY="${SNMP_COMMUNITY:-public}"
+
+log()  { printf '[INGEST] %s\n' "$*" | tee -a "$LOG_FILE"; }
+warn() { printf '[WARN] %s\n' "$*" | tee -a "$LOG_FILE" >&2; }
+
+ensure_dep() {
+  local bin="$1" pkg="$2"
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    warn "$bin not found — installing $pkg..."
+    sudo apt-get update -y && sudo apt-get install -y "$pkg"
+  fi
+}
+
+ensure_dep curl curl
+ensure_dep jq jq
+ensure_dep yq yq
+
+[[ ! -f "$INVENTORY_FILE" ]] && { warn "Inventory not found: $INVENTORY_FILE"; exit 1; }
+
+log "Phase 7 ingestion starting, inventory: $INVENTORY_FILE"
+
+# ---------------- YAML validation ----------------
+if ! yq eval '.' "$INVENTORY_FILE" >/dev/null 2>&1; then
+  warn "Inventory YAML is invalid. Fix Phase 6 output."
+  exit 1
+fi
+
+# ---------------- NetBox helpers ----------------
+nb_get() { curl -s -H "Authorization: Token $NETBOX_TOKEN" "$NETBOX_URL/api/$1/"; }
+nb_post() { curl -s -X POST -H "Authorization: Token $NETBOX_TOKEN" -H "Content-Type: application/json" -d "$2" "$NETBOX_URL/api/$1/"; }
+nb_patch() { curl -s -X PATCH -H "Authorization: Token $NETBOX_TOKEN" -H "Content-Type: application/json" -d "$2" "$NETBOX_URL/api/$1/"; }
+nb_first_id() { nb_get "$1?$2" | jq -r '.results[0].id // empty'; }
+
+slugify() { echo "$1" | tr '[:upper:]' '[:lower:]' | tr ' /' '--' | tr -cd 'a-z0-9-_'; }
+
+sanitize() {
+  local s="$1"
+  s="${s//$'\t'/  }"
+  s="${s//$'\r'/}"
+  s="${s//$'\n'/\\n}"
+  s="${s//\"/\\\"}"
+  s="${s//\\/\\\\}"
+  echo "$s"
+}
+
+ensure_manufacturer() {
+  local name="$1"
+  local slug; slug=$(slugify "$name")
+  local id; id=$(nb_first_id "dcim/manufacturers" "slug=$slug")
+  if [[ -z "$id" ]]; then
+    log "Creating manufacturer: $name"
+    id=$(nb_post "dcim/manufacturers" "{\"name\":\"$name\",\"slug\":\"$slug\"}" | jq -r '.id')
+  fi
+  echo "$id"
+}
+
+ensure_device_role() {
+  local name="$1"
+  local slug; slug=$(slugify "$name")
+  local id; id=$(nb_first_id "dcim/device-roles" "slug=$slug")
+  if [[ -z "$id" ]]; then
+    log "Creating device role: $name"
+    id=$(nb_post "dcim/device-roles" "{\"name\":\"$name\",\"slug\":\"$slug\"}" | jq -r '.id')
+  fi
+  echo "$id"
+}
+
+ensure_platform() {
+  local name="$1"
+  local slug; slug=$(slugify "$name")
+  local id; id=$(nb_first_id "dcim/platforms" "slug=$slug")
+  if [[ -z "$id" ]]; then
+    log "Creating platform: $name"
+    id=$(nb_post "dcim/platforms" "{\"name\":\"$name\",\"slug\":\"$slug\"}" | jq -r '.id')
+  fi
+  echo "$id"
+}
+
+ensure_device_type() {
+  local model="$1" manufacturer_id="$2"
+  local slug; slug=$(slugify "$model")
+  local id; id=$(nb_first_id "dcim/device-types" "slug=$slug")
+  if [[ -z "$id" ]]; then
+    log "Creating device type: $model"
+    id=$(nb_post "dcim/device-types" "{\"model\":\"$model\",\"slug\":\"$slug\",\"manufacturer\":$manufacturer_id}" | jq -r '.id')
+  fi
+  echo "$id"
+}
+
+ensure_device() {
+  local name="$1" dev_type_id="$2" role_id="$3" platform_id="$4"
+  local id; id=$(nb_first_id "dcim/devices" "name=$name")
+  if [[ -z "$id" ]]; then
+    log "Creating device: $name"
+    id=$(nb_post "dcim/devices" "{\"name\":\"$name\",\"device_type\":$dev_type_id,\"device_role\":$role_id,\"platform\":$platform_id}" | jq -r '.id')
+  fi
+  echo "$id"
+}
+
+ensure_primary_ip() {
+  local device_id="$1" ip="$2"
+  [[ -z "$ip" || "$ip" == "null" ]] && return
+
+  local ip_id; ip_id=$(nb_first_id "ipam/ip-addresses" "address=$ip")
+  if [[ -z "$ip_id" ]]; then
+    ip_id=$(nb_post "ipam/ip-addresses" "{\"address\":\"$ip\"}" | jq -r '.id')
+  fi
+
+  nb_patch "dcim/devices/$device_id" "{\"primary_ip4\":$ip_id}" >/dev/null
+}
+
+ensure_tags() {
+  local device_id="$1" vendor="$2" dtype="$3"
+  local tags_json; tags_json=$(jq -n --arg v "$vendor" --arg t "$dtype" '[{"name":$v},{"name":$t}]')
+  nb_patch "dcim/devices/$device_id" "{\"tags\":$tags_json}" >/dev/null
+}
+
+ensure_custom_fields() {
+  local device_id="$1" descr="$2" loc="$3"
+  local cf_json; cf_json=$(jq -n --arg d "$descr" --arg l "$loc" '{custom_fields:{snmp_descr:$d,snmp_location:$l}}')
+  nb_patch "dcim/devices/$device_id" "$cf_json" >/dev/null
+}
+
+# ---------------- LibreNMS ----------------
+lnms_add_device() {
+  local host="$1"
+  curl -s -X POST -H "X-Auth-Token: $LIBRENMS_TOKEN" -H "Content-Type: application/json" \
+    -d "{\"hostname\":\"$host\",\"community\":\"$SNMP_COMMUNITY\",\"version\":\"v2c\"}" \
+    "$LIBRENMS_URL/api/v0/devices" >/dev/null 2>&1 || true
+}
+
+# ---------------- Model selection DT3 → DT2 → DT1 ----------------
+infer_model_dt3() {
+  local vendor="$1" descr="$2" name="$3"
+  local s="$descr $name"
+
+  case "$vendor" in
+    fortinet)
+      echo "$s" | grep -qi "60F" && echo "FortiGate 60F" && return
+      echo "$s" | grep -qi "40F" && echo "FortiGate 40F" && return
+      ;;
+    ubiquiti)
+      echo "$s" | grep -qi "UniFi Switch 24" && echo "UniFi Switch 24" && return
+      echo "$s" | grep -qi "EdgeRouter X" && echo "EdgeRouter X" && return
+      ;;
+    netgear)
+      echo "$s" | grep -qi "GS108" && echo "Netgear GS108" && return
+      ;;
+    hp-aruba)
+      echo "$s" | grep -qi "2930F" && echo "Aruba 2930F" && return
+      ;;
+    esxi|vmware|vmware-workstation)
+      echo "ESXi Host" && return
+      ;;
+    proxmox)
+      echo "Proxmox Node" && return
+      ;;
+    hyper-v)
+      echo "Hyper-V Host" && return
+      ;;
+  esac
+
+  echo ""
+}
+
+infer_dt2_model() {
+  local vendor="$1" dtype="$2"
+  echo "$vendor $dtype" | sed 's/-/ /g'
+}
+
+infer_dt1_model() {
+  local dtype="$1"
+  echo "Generic $dtype"
+}
+
+map_vendor_name() {
+  case "$1" in
+    fortinet) echo "Fortinet" ;;
+    ubiquiti) echo "Ubiquiti" ;;
+    netgear) echo "Netgear" ;;
+    hp-aruba) echo "HPE Aruba" ;;
+    opnsense) echo "OPNsense" ;;
+    pfsense) echo "pfSense" ;;
+    esxi|vmware|vmware-workstation) echo "VMware" ;;
+    proxmox) echo "Proxmox" ;;
+    hyper-v) echo "Microsoft" ;;
+    kvm-libvirt) echo "KVM/libvirt" ;;
+    *) echo "Generic" ;;
+  esac
+}
+
+map_role_name() {
+  case "$1" in
+    firewall) echo "Firewall" ;;
+    switch) echo "Switch" ;;
+    hypervisor) echo "Hypervisor" ;;
+    network-appliance) echo "Network Appliance" ;;
+    unix-like|windows-like) echo "Server" ;;
+    *) echo "Device" ;;
+  esac
+}
+
+# ---------------- Main ingestion loop ----------------
+
+yq eval -o=json '.hosts[]' "$INVENTORY_FILE" | jq -c '.' | while read -r item; do
+  addr=$(echo "$item" | jq -r '.address')
+  vendor=$(echo "$item" | jq -r '.vendor')
+  dtype=$(echo "$item" | jq -r '.device_type')
+  descr=$(sanitize "$(echo "$item" | jq -r '.snmp_sysDescr // ""')")
+  name=$(sanitize "$(echo "$item" | jq -r '.snmp_sysName // ""')")
+  loc=$(sanitize "$(echo "$item" | jq -r '.snmp_sysLocation // ""')")
+
+  [[ -z "$addr" || "$addr" == "null" ]] && continue
+
+  log "Ingesting $addr (vendor=$vendor, type=$dtype)"
+
+  model=$(infer_model_dt3 "$vendor" "$descr" "$name")
+  [[ -z "$model" ]] && model=$(infer_dt2_model "$vendor" "$dtype")
+  [[ -z "$model" ]] && model=$(infer_dt1_model "$dtype")
+
+  manufacturer_name=$(map_vendor_name "$vendor")
+  role_name=$(map_role_name "$dtype")
+  platform_name="$vendor"
+
+  manufacturer_id=$(ensure_manufacturer "$manufacturer_name")
+  role_id=$(ensure_device_role "$role_name")
+  platform_id=$(ensure_platform "$platform_name")
+  dev_type_id=$(ensure_device_type "$model" "$manufacturer_id")
+
+  dev_name="$addr"
+  [[ -n "$name" && "$name" != "null" ]] && dev_name="$name"
+
+  dev_id=$(ensure_device "$dev_name" "$dev_type_id" "$role_id" "$platform_id")
+
+  ensure_primary_ip "$dev_id" "$addr"
+  ensure_tags "$dev_id" "$vendor" "$dtype"
+  ensure_custom_fields "$dev_id" "$descr" "$loc"
+
+  lnms_add_device "$addr"
+
+  log "✓ $addr → NetBox device_id=$dev_id model=\"$model\" role=\"$role_name\""
+done
+
+log "Phase 7 ingestion complete."
+EOF
+
+chmod +x "$PHASE7_DIR/ingest.sh"
+bash "$PHASE7_DIR/ingest.sh"
+
+}
 
 # ------------------------------------------------------------
 #  Phase 8: Completeness / Promotion
 # ------------------------------------------------------------
+run_phase8() {
 echo "[*] Phase 8: Validations / Completeness checks"
 echo "[*] NetBox:     http://localhost:8080"
 echo "[*] LibreNMS:   http://localhost:8000"
@@ -1001,7 +1327,19 @@ echo "[*] Compute:    $COMPUTE_DIR/discovery.sh"
 echo "[*] Ingestion:  $INGEST_DIR/ingest.sh"
 
 phase_summary 8
+}
 
-echo "[*] Orchestrator v2.4 bootstrap complete!"
+phase_run 0 run_phase1
+phase_run 1 run_phase1
+phase_run 2 run_phase2
+phase_run 3 run_phase3
+phase_run 4 run_phase4
+phase_run 5 run_phase5
+phase_run 6 run_phase6
+phase_run 7 run_phase7
+run_phase8
+
+echo "[*] Orchestrator v$SCRIPT_VERSION"
 echo "[*] Base directory: $BASE_ROOT"
 echo "[*] You can now run ingestion and compute discovery scripts as needed."
+
