@@ -2,16 +2,19 @@
 set -euo pipefail
 
 # ============================================================
-#  Network Mapping Orchestrator — Version 5.0
+#  Network Mapping Orchestrator — Version 5.3
 #  Base: /opt/orchestrator
 #  NetBox (8080) | LibreNMS (8000) | Oxidized (8888)
 #  Passive Traffic | Compute Discovery | Ingestion Pipeline
 # ============================================================
+#  20260421-1940 - v5.3 - YAML fixes and yq reinstall
+#  20260421-1856 - v5.2 - Fixes
+#  20260421-1737 - v5.1 - Flags for re-running specific phases
 #  20260421-1210 - v5.0 - Functionalized
 #  20260421-xxxx - v4.0 - Phase 7 added
-#  20260421-xxxx - Phase 6 added
+#  20260421-xxxx - v3.0 - Phase 6 added
 # ============================================================
-SCRIPT_VERSION="5.0"
+SCRIPT_VERSION="5.3"
 
 echo
 echo "============================================================"
@@ -37,16 +40,47 @@ phase_summary() {
 }
 
 # ------------------------------------------------------------
-#  Root handling
+# Flag + sudo handling (single, clean mechanism)
 # ------------------------------------------------------------
-require_root() {
+FLAG_FILE="${FLAG_FILE:-/tmp/fullstack-flags}"
+
+if [[ -z "${FLAGS_LOADED:-}" ]]; then
+  # First invocation (non-root or root): parse CLI args once
+  RESET=false
+  RERUN_PHASE=""
+  FROM_PHASE=""
+  STATUS=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --reset)  RESET=true ;;
+      --rerun)  RERUN_PHASE="$2"; shift ;;
+      --from)   FROM_PHASE="$2"; shift ;;
+      --status) STATUS=true ;;
+      *)        ;;  # ignore unknown
+    esac
+    shift
+  done
+
+  # Persist flags so sudo pass can read them
+  {
+    echo "RESET=$RESET"
+    echo "RERUN_PHASE=$RERUN_PHASE"
+    echo "FROM_PHASE=$FROM_PHASE"
+    echo "STATUS=$STATUS"
+  } > "$FLAG_FILE"
+
+  export FLAG_FILE FLAGS_LOADED=1
+
+  # Elevate if needed, preserving only FLAG_FILE + FLAGS_LOADED
   if [[ $EUID -ne 0 ]]; then
     echo "[INFO] Elevation required — re-running with sudo..."
-    exec sudo -E bash "$0" "$@"
+    exec sudo -E FLAG_FILE="$FLAG_FILE" FLAGS_LOADED=1 bash "$0"
   fi
-}
-
-require_root
+else
+  # Second invocation (after sudo): just reload flags
+  source "$FLAG_FILE"
+fi
 
 # ------------------------------------------------------------
 #  Docker install + group
@@ -181,6 +215,55 @@ phase_run() {
     touch "$STATE_DIR/phase${num}.done"
     log "Phase $num complete."
 }
+
+# ------------------------------------------------------------
+# Apply flags now that STATE_DIR is valid
+# ------------------------------------------------------------
+
+if $RESET; then
+    echo "[INFO] Resetting orchestrator state..."
+    rm -f "$STATE_DIR"/phase*.done 2>/dev/null || true
+fi
+
+if [[ -n "$RERUN_PHASE" ]]; then
+    echo "[INFO] Re-running phase $RERUN_PHASE..."
+    rm -f "$STATE_DIR/phase${RERUN_PHASE}.done" 2>/dev/null || true
+fi
+
+if [[ -n "$FROM_PHASE" ]]; then
+    echo "[INFO] Running from phase $FROM_PHASE onward..."
+    for f in "$STATE_DIR"/phase*.done; do
+        num=$(basename "$f" | sed 's/phase//' | sed 's/.done//')
+        if (( num >= FROM_PHASE )); then
+            rm -f "$f"
+        fi
+    done
+fi
+
+if $STATUS; then
+    echo ""
+    echo "------------------------------------------------------------"
+    echo " Orchestrator Phase Status"
+    echo "------------------------------------------------------------"
+    for i in {0..8}; do
+        if [[ -f "$STATE_DIR/phase${i}.done" ]]; then
+            echo "Phase $i: COMPLETE"
+        else
+            echo "Phase $i: PENDING"
+        fi
+    done
+    echo "------------------------------------------------------------"
+    exit 0
+fi
+
+# ------------------------------------------------------------
+# Additional Helpers
+# ------------------------------------------------------------
+get_host_ip() {
+    # Finds the LAN‑reachable IP, not 127.0.0.1
+    ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}'
+}
+
 
 # ------------------------------------------------------------
 #  Phase 0: Tags / Network
@@ -532,6 +615,7 @@ phase_summary "2 & 3 (LibreNMS)"
 }
 
 run_phase3() {
+phase_summary "3"
 }
 
 # ------------------------------------------------------------
@@ -706,20 +790,22 @@ phase_summary 5
 }
 
 # ------------------------------------------------------------
-#  Phase 6: Compute Discovery
+#  Phase 6: Compute Discovery (Patched + Hardened)
 # ------------------------------------------------------------
 run_phase6() {
-mkdir -p "$COMPUTE_DIR"
+  mkdir -p "$COMPUTE_DIR"
 
-cat > "$COMPUTE_DIR/discovery.sh" <<'EOF'
+  cat > "$COMPUTE_DIR/discovery.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUT_DIR="$BASE_DIR/output"
+BASE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OUT_DIR="$BASE_ROOT/output"
 mkdir -p "$OUT_DIR"
 
 INVENTORY_YAML="$OUT_DIR/compute-inventory.yaml"
+INVENTORY_JSON="$OUT_DIR/compute-inventory.json"
+NETBOX_JSON="$OUT_DIR/netbox-ready.json"
 
 log()   { printf '[DISCOVERY] %s\n' "$*"; }
 warn()  { printf '[WARN] %s\n' "$*" >&2; }
@@ -731,6 +817,38 @@ ensure_dep() {
   local bin="$1"
   local pkg="$2"
 
+  # ------------------------------------------------------------
+  # Special case: yq MUST be Mike Farah yq v4+
+  # ------------------------------------------------------------
+  if [[ "$bin" == "yq" ]]; then
+    # If yq exists, verify it's the correct one
+    if command -v yq >/dev/null 2>&1; then
+      if yq --version 2>/dev/null | grep -qi "mikefarah"; then
+        return 0
+      else
+        warn "Incorrect yq detected — replacing with Mike Farah yq v4..."
+      fi
+    else
+      warn "yq not found — installing Mike Farah yq v4..."
+    fi
+
+    # Install correct yq
+    sudo wget -q https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 \
+      -O /usr/bin/yq
+    sudo chmod +x /usr/bin/yq
+
+    # Verify installation
+    if ! yq --version 2>/dev/null | grep -qi "mikefarah"; then
+      warn "Failed to install correct yq — YAML validation will be disabled."
+      return 1
+    fi
+
+    return 0
+  fi
+
+  # ------------------------------------------------------------
+  # Default dependency handling for all other binaries
+  # ------------------------------------------------------------
   if ! command -v "$bin" >/dev/null 2>&1; then
     warn "$bin not found — installing $pkg..."
     if command -v apt-get >/dev/null 2>&1; then
@@ -741,10 +859,13 @@ ensure_dep() {
   fi
 }
 
+
+
 ensure_dep nmap nmap
 ensure_dep nc netcat-openbsd
 ensure_dep curl curl
 ensure_dep snmpget snmp
+ensure_dep yq yq
 
 SNMP_COMMUNITY="${SNMP_COMMUNITY:-public}"
 
@@ -806,7 +927,7 @@ fetch_http()  { curl -ks --max-time 2 "http://$1" 2>/dev/null || true; }
 fetch_https() { curl -ks --max-time 2 "https://$1" 2>/dev/null || true; }
 
 # ------------------------------------------------------------
-# SNMP Detection (sysObjectID + sysDescr + sysName + sysLocation)
+# SNMP Detection
 # ------------------------------------------------------------
 snmp_query() {
   local host="$1"
@@ -826,7 +947,7 @@ detect_snmp_vendor() {
     .1.3.6.1.4.1.41112.*) echo "ubiquiti"; return ;;
     .1.3.6.1.4.1.4526.*) echo "netgear"; return ;;
     .1.3.6.1.4.1.11.*|.1.3.6.1.4.1.14823.*) echo "hp-aruba"; return ;;
-    .1.3.6.1.4.1.8072.*) echo "freebsd"; return ;; # pfSense/OPNsense base
+    .1.3.6.1.4.1.8072.*) echo "freebsd"; return ;;
   esac
 
   echo "unknown"
@@ -843,18 +964,15 @@ snmp_enrich() {
   echo "$descr|$name|$loc"
 }
 
+# ------------------------------------------------------------
+# YAML-safe escaping (corrected)
+# ------------------------------------------------------------
 yaml_escape() {
   local s="$1"
-  # Replace tabs with spaces
-  s="${s//$'\t'/  }"
-  # Escape double quotes
-  s="${s//\"/\\\"}"
-  # Escape backslashes
-  s="${s//\\/\\\\}"
-  # Replace carriage returns
-  s="${s//$'\r'/}"
-  # Replace newlines with literal \n
-  s="${s//$'\n'/\\n}"
+  s="${s//\\/\\\\}"     # escape backslashes
+  s="${s//$'\t'/  }"    # tabs → spaces
+  s="${s//$'\r'/}"      # remove CR
+  s="${s//$'\n'/\\n}"   # newline → literal \n
   echo "$s"
 }
 
@@ -887,7 +1005,7 @@ detect_mac_oui() {
 }
 
 # ------------------------------------------------------------
-# HTTP Vendor Detection (fallback)
+# HTTP Vendor Detection
 # ------------------------------------------------------------
 detect_vendor_http() {
   local host="$1"
@@ -926,16 +1044,44 @@ detect_device_type() {
   local vendor="$1"
 
   case "$vendor" in
-    fortinet) echo "network-appliance"; return ;;
-    ubiquiti) echo "network-appliance"; return ;;
-    netgear) echo "switch"; return ;;
-    hp-aruba) echo "switch"; return ;;
-    opnsense|pfsense) echo "firewall"; return ;;
-    freebsd) echo "firewall"; return ;;
+    fortinet|ubiquiti) echo "network-appliance"; return ;;
+    netgear|hp-aruba) echo "switch"; return ;;
+    opnsense|pfsense|freebsd) echo "firewall"; return ;;
     vmware|esxi|proxmox|hyper-v|kvm-libvirt) echo "hypervisor"; return ;;
   esac
 
   echo "unknown"
+}
+
+# ------------------------------------------------------------
+# YAML Writer (safe)
+# ------------------------------------------------------------
+write_yaml_host() {
+  cat >> "$INVENTORY_YAML" <<YAML
+  - address: "$1"
+    vendor: "$2"
+    device_type: "$3"
+    hypervisor: "$4"
+    ssh_open: $5
+    rdp_3389_open: $6
+    http_open: $7
+    https_open: $8
+    snmp_sysDescr: "$9"
+    snmp_sysName: "${10}"
+    snmp_sysLocation: "${11}"
+YAML
+}
+
+# ------------------------------------------------------------
+# Strip SNMP quotes
+# ------------------------------------------------------------
+strip_snmp_quotes() {
+  local s="$1"
+  # Remove leading/trailing quotes ONLY if both exist
+  if [[ "$s" =~ ^\".*\"$ ]]; then
+    s="${s:1:-1}"
+  fi
+  echo "$s"
 }
 
 # ------------------------------------------------------------
@@ -966,7 +1112,7 @@ while read -r HOST; do
   SNMP_NAME=""
   SNMP_LOC=""
 
-  # 1. Hypervisor (fast)
+  # 1. Hypervisor
   HYPERVISOR=$(detect_hypervisor "$HOST")
   if [[ "$HYPERVISOR" != "none" ]]; then
     VENDOR="$HYPERVISOR"
@@ -974,13 +1120,22 @@ while read -r HOST; do
     EARLY_EXIT=true
   fi
 
-  # 2. SNMP (safe)
+  # 2. SNMP
   if [[ "$EARLY_EXIT" != true ]]; then
     SNMP_VENDOR=$(detect_snmp_vendor "$HOST")
     if [[ "$SNMP_VENDOR" != "none" ]]; then
       VENDOR="$SNMP_VENDOR"
       DEVICE_TYPE=$(detect_device_type "$SNMP_VENDOR")
       IFS="|" read -r SNMP_DESCR SNMP_NAME SNMP_LOC <<< "$(snmp_enrich "$HOST")"
+
+      SNMP_DESCR=$(strip_snmp_quotes "$SNMP_DESCR")
+      SNMP_NAME=$(strip_snmp_quotes "$SNMP_NAME")
+      SNMP_LOC=$(strip_snmp_quotes "$SNMP_LOC")
+
+      SNMP_DESCR_ESCAPED=$(yaml_escape "$SNMP_DESCR")
+      SNMP_NAME_ESCAPED=$(yaml_escape "$SNMP_NAME")
+      SNMP_LOC_ESCAPED=$(yaml_escape "$SNMP_LOC")
+
       EARLY_EXIT=true
     fi
   fi
@@ -1010,52 +1165,79 @@ while read -r HOST; do
     fi
   fi
 
-SNMP_DESCR_ESCAPED=$(yaml_escape "$SNMP_DESCR")
-SNMP_NAME_ESCAPED=$(yaml_escape "$SNMP_NAME")
-SNMP_LOC_ESCAPED=$(yaml_escape "$SNMP_LOC")
+  # Escape SNMP fields
+  SNMP_DESCR_ESCAPED=$(yaml_escape "$SNMP_DESCR")
+  SNMP_NAME_ESCAPED=$(yaml_escape "$SNMP_NAME")
+  SNMP_LOC_ESCAPED=$(yaml_escape "$SNMP_LOC")
 
-  cat >> "$INVENTORY_YAML" <<YAML
-  - address: "$HOST"
-    vendor: "$VENDOR"
-    device_type: "$DEVICE_TYPE"
-    hypervisor: "$HYPERVISOR"
-    ssh_open: $SSH_OPEN
-    rdp_3389_open: $RDP_OPEN
-    http_open: $HTTP_OPEN
-    https_open: $HTTPS_OPEN
-    snmp_sysDescr: "$SNMP_DESCR_ESCAPED"
-    snmp_sysName: "$SNMP_NAME_ESCAPED"
-    snmp_sysLocation: "$SNMP_LOC_ESCAPED"
-YAML
+  write_yaml_host \
+    "$HOST" "$VENDOR" "$DEVICE_TYPE" "$HYPERVISOR" \
+    "$SSH_OPEN" "$RDP_OPEN" "$HTTP_OPEN" "$HTTPS_OPEN" \
+    "$SNMP_DESCR_ESCAPED" "$SNMP_NAME_ESCAPED" "$SNMP_LOC_ESCAPED"
 
 done < "$TMP_HOSTS"
 
+# ------------------------------------------------------------
+# YAML Validation (corrected)
+# ------------------------------------------------------------
+if command -v yq >/dev/null 2>&1; then
+  if ! yq eval '.' "$INVENTORY_YAML" >/dev/null 2>&1; then
+    warn "Generated YAML is invalid — fix escaping."
+    exit 1
+  fi
+  log "YAML validation passed."
+fi
+
+# ------------------------------------------------------------
+# JSON Output
+# ------------------------------------------------------------
+if command -v yq >/dev/null 2>&1; then
+  yq eval -o=json "$INVENTORY_YAML" > "$INVENTORY_JSON" || warn "JSON conversion failed."
+  log "JSON inventory written to $INVENTORY_JSON"
+fi
+
+# ------------------------------------------------------------
+# NetBox-ready JSON
+# ------------------------------------------------------------
+if [[ -f "$INVENTORY_JSON" ]]; then
+  jq '{
+    devices: [
+      .hosts[] | {
+        name: (.snmp_sysName // .address),
+        primary_ip4: .address,
+        device_type: .device_type,
+        vendor: .vendor,
+        site: (.snmp_sysLocation // "unknown"),
+        tags: ["auto-discovered"]
+      }
+    ]
+  }' "$INVENTORY_JSON" > "$NETBOX_JSON" || warn "NetBox conversion failed."
+
+  log "NetBox-ready inventory written to $NETBOX_JSON"
+fi
+
 log "Phase 6 complete — inventory written to $INVENTORY_YAML"
-log "Next step: map these into NetBox/LibreNMS as devices, VMs, or hypervisors."
+log "Next step: Phase 7 ingestion."
 EOF
 
-chmod +x "$COMPUTE_DIR/discovery.sh"
-
-bash "$COMPUTE_DIR/discovery.sh"
-
-phase_summary 6
+  chmod +x "$COMPUTE_DIR/discovery.sh"
+  phase_summary 6
 }
 
 # ------------------------------------------------------------
 #  Phase 7: Ingestion Engine (DT3 → DT2 → DT1)
 # ------------------------------------------------------------
 run_phase7() {
-BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PHASE7_DIR="$BASE_DIR/ingestion"
+PHASE7_DIR="$BASE_ROOT/ingestion"
 mkdir -p "$PHASE7_DIR"
 
 cat > "$PHASE7_DIR/ingest.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INVENTORY_FILE="$BASE_DIR/../compute/output/compute-inventory.yaml"
-LOG_FILE="$BASE_DIR/ingestion.log"
+BASE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INVENTORY_FILE="$BASE_ROOT/../compute/output/compute-inventory.yaml"
+LOG_FILE="$BASE_ROOT/ingestion.log"
 
 NETBOX_URL="${NETBOX_URL:-http://localhost:8080}"
 NETBOX_TOKEN="${NETBOX_TOKEN:-netbox_admin_token_here}"
@@ -1249,7 +1431,7 @@ map_vendor_name() {
     esxi|vmware|vmware-workstation) echo "VMware" ;;
     proxmox) echo "Proxmox" ;;
     hyper-v) echo "Microsoft" ;;
-    kvm-libvirt) echo "KVM/libvirt" ;;
+    kvm-libvirt) echo "KVM/liblibvirt" ;;
     *) echo "Generic" ;;
   esac
 }
@@ -1310,18 +1492,20 @@ log "Phase 7 ingestion complete."
 EOF
 
 chmod +x "$PHASE7_DIR/ingest.sh"
-bash "$PHASE7_DIR/ingest.sh"
 
+phase_summary 7
 }
 
 # ------------------------------------------------------------
 #  Phase 8: Completeness / Promotion
 # ------------------------------------------------------------
 run_phase8() {
+local HIP
+HIP=$(get_host_ip)
 echo "[*] Phase 8: Validations / Completeness checks"
-echo "[*] NetBox:     http://localhost:8080"
-echo "[*] LibreNMS:   http://localhost:8000"
-echo "[*] Oxidized:   http://localhost:8888"
+echo "[*] NetBox:     http://$HIP:8080"
+echo "[*] LibreNMS:   http://$HIP:8000"
+echo "[*] Oxidized:   http://$HIP:8888"
 echo "[*] Passive:    Zeek / Suricata / Ntopng (host mode)"
 echo "[*] Compute:    $COMPUTE_DIR/discovery.sh"
 echo "[*] Ingestion:  $INGEST_DIR/ingest.sh"
@@ -1329,7 +1513,10 @@ echo "[*] Ingestion:  $INGEST_DIR/ingest.sh"
 phase_summary 8
 }
 
-phase_run 0 run_phase1
+# ------------------------------------------------------------
+#  Main Execution
+# ------------------------------------------------------------
+phase_run 0 run_phase0
 phase_run 1 run_phase1
 phase_run 2 run_phase2
 phase_run 3 run_phase3
@@ -1342,4 +1529,7 @@ run_phase8
 echo "[*] Orchestrator v$SCRIPT_VERSION"
 echo "[*] Base directory: $BASE_ROOT"
 echo "[*] You can now run ingestion and compute discovery scripts as needed."
-
+echo "[*] You can also use the following flags:"
+echo "[*]                                       --reset         - Deletes all phase state files."
+echo "[*]                                       --rerun <phase> - Re-runs only the phase you specify."
+echo "[*]                                       --from  <phase> - Runs from a specific phase onward."
