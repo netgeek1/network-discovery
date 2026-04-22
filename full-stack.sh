@@ -1,12 +1,18 @@
+#################
+# Phase 7 still not working
+#################
+
 #!/usr/bin/env bash
 set -euo pipefail
 
 # ============================================================
-#  Network Mapping Orchestrator — Version 5.6
+#  Network Mapping Orchestrator — Version 5.8
 #  Base: /opt/orchestrator
 #  NetBox (8080) | LibreNMS (8000) | Oxidized (8888)
 #  Passive Traffic | Compute Discovery | Ingestion Pipeline
 # ============================================================
+#  20260421-2211 - v5.8 - Phase 7 fixes
+#  20260421-2211 - v5.7 - Phase 7 fixes
 #  20260421-2127 - v5.6 - Phase 7 fixes
 #  20260421-2113 - v5.5 - Phase 7 fixes
 #  20260421-2000 - v5.4 - Phase 7 fixes
@@ -17,7 +23,7 @@ set -euo pipefail
 #  20260421-xxxx - v4.0 - Phase 7 added
 #  20260421-xxxx - v3.0 - Phase 6 added
 # ============================================================
-SCRIPT_VERSION="5.6"
+SCRIPT_VERSION="5.8"
 
 echo
 echo "============================================================"
@@ -1244,19 +1250,17 @@ LOG_FILE="$BASE_ROOT/ingestion.log"
 
 SNMP_COMMUNITY="${SNMP_COMMUNITY:-public}"
 
-# IMPORTANT: never write to stdout
 log()  { printf '[INGEST] %s\n' "$*" | tee -a "$LOG_FILE" >&2; }
 warn() { printf '[WARN] %s\n' "$*" | tee -a "$LOG_FILE" >&2; }
 
 ensure_dep() {
   local bin="$1" pkg="$2"
 
-  # yq special case
   if [[ "$bin" == "yq" ]]; then
     if command -v yq >/dev/null 2>&1 && yq --version 2>/dev/null | grep -qi mikefarah; then
       return 0
     fi
-    warn "Installing correct yq..."
+    warn "Installing Mike Farah yq..."
     sudo wget -q https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/bin/yq
     sudo chmod +x /usr/bin/yq
     return 0
@@ -1276,32 +1280,29 @@ ensure_dep yq yq
 
 log "Phase 7 ingestion starting, inventory: $INVENTORY_FILE"
 
-# Validate YAML
 if ! yq eval '.' "$INVENTORY_FILE" >/dev/null 2>&1; then
   warn "Inventory YAML invalid."
   exit 1
 fi
 
-# Host IP → URLs
 get_host_ip() { ip route get 1 | awk '{print $7; exit}'; }
 
 NETBOX_URL="http://$(get_host_ip):8080"
 LIBRENMS_URL="http://$(get_host_ip):8000"
 
-# Secret prompts
-read -r -s -p "Enter NetBox API token (blank = skip NetBox): " NETBOX_TOKEN; echo
-read -r -s -p "Enter LibreNMS API token (blank = skip LibreNMS): " LIBRENMS_TOKEN; echo
+read -r -s -p "Enter NetBox API token (blank = skip NetBox): " NETBOX_TOKEN < /dev/tty; echo
+read -r -s -p "Enter LibreNMS API token (blank = skip LibreNMS): " LIBRENMS_TOKEN < /dev/tty; echo
 
 if [[ -z "$NETBOX_TOKEN" ]]; then warn "Skipping NetBox push."; fi
 if [[ -z "$LIBRENMS_TOKEN" ]]; then warn "Skipping LibreNMS push."; fi
 
-# NetBox helpers
 nb_get()   { curl -s -H "Authorization: Token $NETBOX_TOKEN" "$NETBOX_URL/api/$1/"; }
 nb_post()  { curl -s -X POST  -H "Authorization: Token $NETBOX_TOKEN" -H "Content-Type: application/json" -d "$2" "$NETBOX_URL/api/$1/"; }
 nb_patch() { curl -s -X PATCH -H "Authorization: Token $NETBOX_TOKEN" -H "Content-Type: application/json" -d "$2" "$NETBOX_URL/api/$1/"; }
 nb_first_id() { nb_get "$1?$2" | jq -r '.results[0].id // empty'; }
 
 slugify() { echo "$1" | tr '[:upper:]' '[:lower:]' | tr ' /' '--' | tr -cd 'a-z0-9-_'; }
+trim()    { echo "$1" | sed 's/^[ \t]*//;s/[ \t]*$//'; }
 
 sanitize() {
   local s="$1"
@@ -1313,7 +1314,6 @@ sanitize() {
   echo "$s"
 }
 
-# ---------------- SITE SELECTION ----------------
 select_site() {
   local count
   count=$(nb_get "dcim/sites" | jq '.count')
@@ -1333,41 +1333,103 @@ select_site() {
   log "Multiple sites detected:"
   nb_get dcim/sites | jq -r '.results[] | "\(.id): \(.name)"'
 
-  read -r -p "Enter site ID to use: " sid
+  local sid
+  read -r -p "Enter site ID to use: " sid < /dev/tty
   echo "$sid"
 }
 
-# ---------------- MANUFACTURER INFERENCE ----------------
-infer_manufacturer() {
-  local descr="$1"
+infer_manufacturer_suggest() {
+  local s_lower; s_lower=$(echo "$1" | tr '[:upper:]' '[:lower:]')
 
-  # Known patterns
-  if echo "$descr" | grep -qi "netgear"; then echo "Netgear"; return; fi
-  if echo "$descr" | grep -qi "aruba"; then echo "HPE Aruba"; return; fi
-  if echo "$descr" | grep -qi "hp "; then echo "HPE"; return; fi
-  if echo "$descr" | grep -qi "cisco"; then echo "Cisco"; return; fi
-  if echo "$descr" | grep -qi "ubiquiti"; then echo "Ubiquiti"; return; fi
+  [[ "$s_lower" =~ netgear ]]   && echo "Netgear"   && return
+  [[ "$s_lower" =~ aruba ]]     && echo "HPE Aruba" && return
+  [[ "$s_lower" =~ hp\  ]]      && echo "HPE"       && return
+  [[ "$s_lower" =~ cisco ]]     && echo "Cisco"     && return
+  [[ "$s_lower" =~ ubiquiti ]]  && echo "Ubiquiti"  && return
+  [[ "$s_lower" =~ fortigate ]] && echo "Fortinet"  && return
+  [[ "$s_lower" =~ pfsense ]]   && echo "pfSense"   && return
+  [[ "$s_lower" =~ opnsense ]]  && echo "OPNsense"  && return
+  [[ "$s_lower" =~ esxi ]]      && echo "VMware"    && return
+  [[ "$s_lower" =~ proxmox ]]   && echo "Proxmox"   && return
 
-  # Ask user
-  read -r -p "Unknown manufacturer for '$descr'. Enter manufacturer: " m
-  echo "$m"
+  echo ""
 }
 
-# ---------------- MODEL INFERENCE ----------------
-infer_model() {
+prompt_manufacturer() {
   local descr="$1"
+  local suggestion; suggestion=$(infer_manufacturer_suggest "$descr")
 
-  # Try simple extraction
-  if echo "$descr" | grep -q '[A-Za-z0-9]\{3,\}'; then
-    echo "$descr"
-    return
+  if [[ -n "$suggestion" ]]; then
+    printf "Unknown manufacturer for '%s'. Suggested: %s\n" "$descr" "$suggestion" >&2
+    local ans
+    read -r -p "Enter manufacturer [$suggestion]: " ans < /dev/tty
+    ans=$(trim "$ans")
+    [[ -z "$ans" ]] && ans="$suggestion"
+    printf "%s" "$ans"
+  else
+    printf "Unknown manufacturer for '%s'.\n" "$descr" >&2
+    local ans
+    read -r -p "Enter manufacturer: " ans < /dev/tty
+    printf "%s" "$(trim "$ans")"
   fi
-
-  read -r -p "Unknown model for '$descr'. Enter model: " m
-  echo "$m"
 }
 
-# ---------------- Ensure NetBox objects ----------------
+infer_model_suggest() { echo "$1"; }
+
+prompt_model() {
+  local descr="$1"
+  local suggestion
+  suggestion=$(infer_model_suggest "$descr" 2>/dev/null || echo "$descr")
+
+  printf "Model for '%s'. Suggested: %s\n" "$descr" "$suggestion" >&2
+  local ans
+  read -r -p "Enter model [$suggestion]: " ans < /dev/tty
+  ans=$(trim "$ans")
+  [[ -z "$ans" ]] && ans="$suggestion"
+  printf "%s" "$ans"
+}
+
+infer_platform() {
+  local descr="$1"
+  local manufacturer="$2"
+  local s_lower; s_lower=$(echo "$descr" | tr '[:upper:]' '[:lower:]')
+
+  [[ "$s_lower" =~ ios      ]] && echo "cisco-ios" && return
+  [[ "$s_lower" =~ arubaos  ]] && echo "arubaos"   && return
+  [[ "$s_lower" =~ edgeos   ]] && echo "edgeos"    && return
+  [[ "$s_lower" =~ routeros ]] && echo "routeros"  && return
+  [[ "$s_lower" =~ pfsense  ]] && echo "pfsense"   && return
+  [[ "$s_lower" =~ opnsense ]] && echo "opnsense"  && return
+  [[ "$s_lower" =~ esxi     ]] && echo "esxi"      && return
+  [[ "$s_lower" =~ proxmox  ]] && echo "proxmox"   && return
+
+  echo "$manufacturer"
+}
+
+infer_role() {
+  local vendor="$1" dtype="$2" hyper="$3" descr="$4"
+
+  local v=$(echo "$vendor" | tr '[:upper:]' '[:lower:]')
+  local d=$(echo "$dtype"  | tr '[:upper:]' '[:lower:]')
+  local h=$(echo "$hyper"  | tr '[:upper:]' '[:lower:]')
+  local s=$(echo "$descr"  | tr '[:upper:]' '[:lower:]')
+
+  [[ "$v" =~ fortinet|pfsense|opnsense ]] && echo "Firewall"   && return
+  [[ "$v" =~ ubiquiti|netgear|aruba|hp ]] && echo "Switch"     && return
+  [[ "$h" != "none" ]]                    && echo "Hypervisor" && return
+  [[ "$d" =~ linux|windows|unix ]]        && echo "Server"     && return
+
+  [[ "$s" =~ fortigate ]] && echo "Firewall"    && return
+  [[ "$s" =~ firewall  ]] && echo "Firewall"    && return
+  [[ "$s" =~ switch    ]] && echo "Switch"      && return
+  [[ "$s" =~ router    ]] && echo "Router"      && return
+  [[ "$s" =~ ap\  ]]      && echo "Wireless AP" && return
+  [[ "$s" =~ esxi      ]] && echo "Hypervisor"  && return
+  [[ "$s" =~ hyper-v   ]] && echo "Hypervisor"  && return
+
+  echo "Device"
+}
+
 ensure_manufacturer() {
   local name="$1"
   local slug; slug=$(slugify "$name")
@@ -1417,7 +1479,9 @@ ensure_device() {
   local id; id=$(nb_first_id "dcim/devices" "name=$name")
   if [[ -z "$id" ]]; then
     log "Creating device: $name"
-    id=$(nb_post "dcim/devices" "{\"name\":\"$name\",\"device_type\":$dev_type_id,\"device_role\":$role_id,\"platform\":$platform_id,\"site\":$site_id}" | jq -r '.id')
+    id=$(nb_post "dcim/devices" \
+      "{\"name\":\"$name\",\"device_type\":$dev_type_id,\"device_role\":$role_id,\"platform\":$platform_id,\"site\":$site_id}" \
+      | jq -r '.id')
   fi
   echo "$id"
 }
@@ -1434,25 +1498,18 @@ ensure_primary_ip() {
   nb_patch "dcim/devices/$device_id" "{\"primary_ip4\":$ip_id}" >/dev/null
 }
 
-# ---------------- DR1 Role Mapping ----------------
-infer_role() {
-  local vendor="$1"
-  local dtype="$2"
-  local hyper="$3"
-
-  vendor=$(echo "$vendor" | tr '[:upper:]' '[:lower:]')
-  dtype=$(echo "$dtype" | tr '[:upper:]' '[:lower:]')
-  hyper=$(echo "$hyper" | tr '[:upper:]' '[:lower:]')
-
-  if [[ "$vendor" =~ (fortinet|pfsense|opnsense) ]]; then echo "Firewall"; return; fi
-  if [[ "$vendor" =~ (ubiquiti|netgear|aruba|hp) ]]; then echo "Switch"; return; fi
-  if [[ "$hyper" != "none" ]]; then echo "Hypervisor"; return; fi
-  if [[ "$dtype" =~ (linux|windows|unix) ]]; then echo "Server"; return; fi
-
-  echo "Device"
+ensure_tags() {
+  local device_id="$1" vendor="$2" dtype="$3"
+  local tags_json; tags_json=$(jq -n --arg v "$vendor" --arg t "$dtype" '[{"name":$v},{"name":$t}]')
+  nb_patch "dcim/devices/$device_id" "{\"tags\":$tags_json}" >/dev/null
 }
 
-# ---------------- LibreNMS ----------------
+ensure_custom_fields() {
+  local device_id="$1" descr="$2" loc="$3"
+  local cf_json; cf_json=$(jq -n --arg d "$descr" --arg l "$loc" '{custom_fields:{snmp_descr:$d,snmp_location:$l}}')
+  nb_patch "dcim/devices/$device_id" "$cf_json" >/dev/null
+}
+
 lnms_add_device() {
   local host="$1"
   [[ -z "$LIBRENMS_TOKEN" ]] && return
@@ -1461,14 +1518,18 @@ lnms_add_device() {
     "$LIBRENMS_URL/api/v0/devices" >/dev/null 2>&1 || true
 }
 
-# ---------------- MAIN LOOP ----------------
 site_id=""
 if [[ -n "$NETBOX_TOKEN" ]]; then
   site_id=$(select_site)
   log "Using site ID: $site_id"
 fi
 
-yq eval -o=json '.hosts[]' "$INVENTORY_FILE" | jq -c '.' | while read -r item; do
+TMP_HOSTS=$(mktemp)
+yq eval -o=json '.hosts[]' "$INVENTORY_FILE" | jq -c '.' > "$TMP_HOSTS"
+
+while IFS= read -r item; do
+  [[ -z "$item" ]] && continue
+
   addr=$(echo "$item" | jq -r '.address')
   vendor=$(echo "$item" | jq -r '.vendor')
   dtype=$(echo "$item" | jq -r '.device_type')
@@ -1477,52 +1538,55 @@ yq eval -o=json '.hosts[]' "$INVENTORY_FILE" | jq -c '.' | while read -r item; d
   name_raw=$(echo "$item" | jq -r '.snmp_sysName // ""')
   loc_raw=$(echo "$item" | jq -r '.snmp_sysLocation // ""')
 
-  [[ -z "$addr" ]] && continue
+  [[ -z "$addr" || "$addr" == "null" ]] && continue
 
   descr=$(sanitize "$descr_raw")
   name=$(sanitize "$name_raw")
   loc=$(sanitize "$loc_raw")
 
-  log "Processing $addr ($descr)"
+  log "Processing $addr ($descr_raw)"
 
-  # Manufacturer + model inference
-  manufacturer_name=$(infer_manufacturer "$descr_raw")
-  model=$(infer_model "$descr_raw")
+  manufacturer_name=$(prompt_manufacturer "$descr_raw")
+  model=$(prompt_model "$descr_raw")
+  platform_name=$(infer_platform "$descr_raw" "$manufacturer_name")
+  role_name=$(infer_role "$vendor" "$dtype" "$hyper" "$descr_raw")
 
-  role_name=$(infer_role "$vendor" "$dtype" "$hyper")
-  platform_name="$manufacturer_name"
-
-  # NetBox push
   if [[ -n "$NETBOX_TOKEN" ]]; then
     mid=$(ensure_manufacturer "$manufacturer_name")
     rid=$(ensure_device_role "$role_name")
     pid=$(ensure_platform "$platform_name")
     dtid=$(ensure_device_type "$model" "$mid")
 
-    dev_name="$name_raw"
+    dev_name=$(trim "$name_raw")
     [[ -z "$dev_name" || "$dev_name" == "null" ]] && dev_name="$addr"
 
     did=$(ensure_device "$dev_name" "$dtid" "$rid" "$pid" "$site_id")
 
     ensure_primary_ip "$did" "$addr"
+    ensure_tags "$did" "$vendor" "$dtype"
+    ensure_custom_fields "$did" "$descr" "$loc"
 
-    log "✓ NetBox: $addr → device_id=$did"
+    log "✓ NetBox: $addr → device_id=$did model=\"$model\" role=\"$role_name\""
+  else
+    log "Skipping NetBox for $addr (no token)."
   fi
 
-  # LibreNMS push
   if [[ -n "$LIBRENMS_TOKEN" ]]; then
     lnms_add_device "$addr"
     log "✓ LibreNMS: $addr added"
+  else
+    log "Skipping LibreNMS for $addr (no token)."
   fi
 
-done
+done < "$TMP_HOSTS"
+
+rm -f "$TMP_HOSTS"
 
 log "Phase 7 ingestion complete."
 EOF
 
-chmod +x "$PHASE7_DIR/ingest.sh"
-
-phase_summary 7
+  chmod +x "$PHASE7_DIR/ingest.sh"
+  phase_summary 7
 }
 
 # ------------------------------------------------------------
